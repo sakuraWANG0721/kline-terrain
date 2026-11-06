@@ -7,7 +7,7 @@
 <title>夜间行情地形图</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Zen+Kaku+Gothic+New:wght@500;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Shippori+Mincho+B1:wght@800&family=Zen+Kaku+Gothic+New:wght@500;700&display=swap" rel="stylesheet">
 <style>
   :root {
     --bg: #04060d;
@@ -18,7 +18,7 @@
     color-scheme: dark;
   }
   html, body { background: var(--bg); color: var(--ink); }
-  .scroller { position: relative; height: calc(100svh * 2.6); }
+  .scroller { position: relative; height: calc(100svh * 2.8); }
   .stage {
     position: sticky;
     top: 0;
@@ -105,7 +105,7 @@
 
 <script>
 /* 地形部分：React Bits「Topography」(DavidHDev/react-bits, MIT + Commons Clause) の WebGL2 コードを
-   React なしで動くように移植。K線の飛行軌跡・大陰線・地割れは追加で実装。 */
+   React なしで動くように移植。K線の飛行軌跡・タイトル・落下・地割れは追加で実装。 */
 (() => {
 'use strict';
 const FOV = 0.32;
@@ -838,6 +838,45 @@ void main() {
   outColor = vec4(col * a, a);
 }`;
 
+/* ---------- タイトル：山のうしろから朝日のように昇る、つや消し銀の文字 ---------- */
+const TITLE_TEXT = '投資家心理分析';
+const TITLE_VERTEX = `#version 300 es
+precision highp float;
+uniform mat4 uViewProj;
+uniform vec3 uCenter;
+uniform vec2 uHalf;   // 画面上の半幅・半高（NDC）
+out vec2 vUv;
+void main() {
+  vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1)) * 2.0 - 1.0;
+  vec4 c = uViewProj * vec4(uCenter, 1.0);
+  c.xy += corner * uHalf * c.w;
+  gl_Position = c;
+  vUv = vec2(corner.x * 0.5 + 0.5, 0.5 - corner.y * 0.5);
+}`;
+
+const TITLE_FRAGMENT = `#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+uniform float uMode;   // 0 = 文字, 1 = 後ろの光
+uniform float uAlpha;
+uniform float uSweep;
+in vec2 vUv;
+out vec4 outColor;
+void main() {
+  if (uMode > 0.5) {
+    vec2 p = (vUv - 0.5) * 2.0;
+    float a = exp(-dot(p, p) * 2.6) * uAlpha;
+    outColor = vec4(vec3(0.80, 0.86, 1.0) * a, a);
+    return;
+  }
+  vec4 t = texture(uTex, vUv);
+  // 光の帯がときどき斜めに金属の上を流れる
+  float band = vUv.x + vUv.y * 0.45 - uSweep;
+  float sheen = exp(-band * band * 70.0) * 0.55;
+  vec3 col = min(t.rgb + vec3(sheen) * t.a, vec3(t.a));
+  outColor = vec4(col, t.a) * uAlpha;
+}`;
+
 const S = {
   color: '#4f7cff',
   lineCount: 22,
@@ -897,6 +936,7 @@ if (!terrain || !downProgram || !blurProgram || !compositeProgram || !candleProg
   return;
 }
 canvas.addEventListener('webglcontextlost', event => event.preventDefault());
+const titleProgram = link(gl, TITLE_VERTEX, TITLE_FRAGMENT);
 
 const vao = gl.createVertexArray();
 const format = floatTargets ? gl.RGBA16F : gl.RGBA8;
@@ -917,6 +957,110 @@ for (let i = 0; i < 4; i++) {
   gl.vertexAttribDivisor(i, 1);
 }
 gl.bindVertexArray(null);
+
+/* タイトルの文字は 2D キャンバスで一度だけ描いて、テクスチャにして 3D の中に置く */
+const TITLE_DUR = 2.6;   // 昇りきるまでの秒数
+const TITLE_TILT = 19;   // タイトルが出ているあいだの俯角（少し顔を上げて空を見せる）
+const TITLE_NY = 0.66;   // 昇りきったときの画面の高さ（-1 下端 〜 1 上端）
+const TITLE_DEPTH = 11;  // 視点からの距離。K 線より奥、手前の山より奥
+const title = { ready: false, aspect: 5.5, t: 0, dir: -1, doneAt: null };
+const titleTex = gl.createTexture();
+
+const buildTitle = () => {
+  const px = 200;
+  const family = '"Shippori Mincho B1", "Hiragino Mincho ProN", "Yu Mincho", "YuMincho", serif';
+  const font = `800 ${px}px ${family}`;
+  const c = document.createElement('canvas');
+  let g = c.getContext('2d');
+  g.font = font;
+  const chars = [...TITLE_TEXT];
+  const track = px * 0.16;
+  const widths = chars.map(ch => g.measureText(ch).width);
+  const textW = widths.reduce((a, b) => a + b, 0) + track * (chars.length - 1);
+  const padX = px * 0.3;
+  const padY = px * 0.32;
+  c.width = Math.ceil(textW + padX * 2);
+  c.height = Math.ceil(px + padY * 2);
+  g = c.getContext('2d');
+  g.font = font;
+  g.textBaseline = 'middle';
+  const cy = c.height / 2 + px * 0.02;
+  const top = cy - px * 0.5;
+  const each = fn => {
+    let x = padX;
+    chars.forEach((ch, i) => {
+      fn(ch, x);
+      x += widths[i] + track;
+    });
+  };
+  // 1. 厚み：下のふちに暗い影
+  g.fillStyle = 'rgba(14, 17, 24, 0.9)';
+  each((ch, x) => g.fillText(ch, x, cy + px * 0.025));
+  // 2. つや消しの銀（上が明るく、まん中に少し暗い帯、下でまた明るく）
+  const metal = g.createLinearGradient(0, top, 0, top + px);
+  [
+    [0, '#fbfcfe'],
+    [0.2, '#dde1e8'],
+    [0.44, '#a6adb8'],
+    [0.5, '#7f8693'],
+    [0.55, '#bcc2cc'],
+    [0.78, '#eceef2'],
+    [1, '#9aa1ad']
+  ].forEach(([o, col]) => metal.addColorStop(o, col));
+  g.fillStyle = metal;
+  each((ch, x) => g.fillText(ch, x, cy));
+  // 3. 磨りガラスのような細かい粒（文字の上だけ）
+  const grain = document.createElement('canvas');
+  grain.width = grain.height = 128;
+  const gg = grain.getContext('2d');
+  const img = gg.createImageData(128, 128);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const v = 110 + Math.random() * 145;
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+    img.data[i + 3] = 255;
+  }
+  gg.putImageData(img, 0, 0);
+  g.globalCompositeOperation = 'source-atop';
+  g.globalAlpha = 0.12;
+  g.fillStyle = g.createPattern(grain, 'repeat');
+  g.fillRect(0, 0, c.width, c.height);
+  // 4. ヘアライン：横方向のごく細い筋
+  g.globalAlpha = 1;
+  for (let y = 0; y < c.height; y += 2) {
+    g.fillStyle = `rgba(${Math.random() < 0.5 ? '255, 255, 255' : '40, 46, 58'}, ${(Math.random() * 0.06).toFixed(3)})`;
+    g.fillRect(0, y, c.width, 1);
+  }
+  g.globalCompositeOperation = 'source-over';
+  // 5. ふちの細いハイライト
+  const rim = g.createLinearGradient(0, top, 0, top + px);
+  rim.addColorStop(0, 'rgba(255, 255, 255, 0.7)');
+  rim.addColorStop(0.5, 'rgba(255, 255, 255, 0.12)');
+  rim.addColorStop(1, 'rgba(255, 255, 255, 0.4)');
+  g.strokeStyle = rim;
+  g.lineWidth = Math.max(1, px * 0.008);
+  each((ch, x) => g.strokeText(ch, x, cy));
+
+  gl.bindTexture(gl.TEXTURE_2D, titleTex);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  title.aspect = c.width / c.height;
+  title.ready = true;
+  wake();
+};
+// 明朝体の読み込みを待ってから描く（3 秒待っても来なければ手元の明朝で）
+if (titleProgram) {
+  const fontLoad = document.fonts && document.fonts.load
+    ? document.fonts.load('800 200px "Shippori Mincho B1"', TITLE_TEXT).catch(() => null)
+    : Promise.resolve();
+  Promise.race([fontLoad, new Promise(resolve => setTimeout(resolve, 3000))]).then(buildTitle);
+}
 
 const createTexture = (width, height, internal, wrap) => {
   const texture = gl.createTexture();
@@ -1230,7 +1374,7 @@ const fx = document.getElementById('fx');
 const ctx = fx.getContext('2d');
 const slot = document.getElementById('slot');
 const cue = document.getElementById('cue');
-const END = 1.6; // スクロールできる画面数
+const END = 1.8; // スクロールできる画面数
 // 俯冲が終わったら（q≥1）あとは時間で一気に流す：突き抜け → 画面が平らに → 第2ページへ → 緑の K 線が落ちて地面が割れる
 const T_IMPACT = 1.05; // 落下タイムラインの何秒目で地面にぶつかるか
 const T_END = T_IMPACT + 3;
@@ -1260,17 +1404,24 @@ const updateStory = dt => {
   story.q += (story.s - story.q) * (reduce ? 1 : 1 - Math.exp(-dt / 0.12));
   if (Math.abs(story.s - story.q) < 1e-4) story.q = story.s;
   const q = story.q;
-  story.dive = smoother(unit(q, 0.55, 1.0));
-  // 1 画面ぶん下へスクロールしたら落下スタート。0.9 より上へ戻したら巻き戻し
-  if (q >= 1.0) story.dir = 1;
-  else if (q < 0.9) story.dir = -1;
+  // まずタイトル：少しでも下へスクロールしたら、山のうしろから昇りはじめる（時間で動く）
+  if (q > 0.03) title.dir = 1;
+  else if (q < 0.005) title.dir = -1;
+  if (reduce) title.t = title.dir > 0 ? TITLE_DUR : 0;
+  else title.t = clamp(title.t + dt * (title.dir > 0 ? 1 : -1.6), 0, TITLE_DUR);
+  const risen = title.t >= TITLE_DUR * 0.7;
+  // 俯冲と落下は、タイトルが昇ってから
+  story.dive = smoother(unit(q, 0.75, 1.2)) * smoother(unit(title.t, TITLE_DUR * 0.45, TITLE_DUR * 0.75));
+  if (q >= 1.2 && risen) story.dir = 1;
+  else if (q < 1.1) story.dir = -1;
   if (reduce) story.dropT = story.dir > 0 ? T_END : 0;
   else if (story.dir > 0) story.dropT = Math.min(T_END, story.dropT + dt);
   else story.dropT = Math.max(0, story.dropT - dt * (story.dropT > T_IMPACT ? 6 : 2));
   const T = story.dropT;
   story.crash = Math.pow(unit(T, 0, 0.55), 1.3) * 7.5;
   story.calm = 1 - unit(T, 0, 0.2);
-  S.tilt = 28 + 34 * smoother(unit(T, 0.05, 0.6));
+  const baseTilt = 28 - (28 - TITLE_TILT) * smoother(unit(title.t, 0, TITLE_DUR * 0.85));
+  S.tilt = baseTilt + (62 - baseTilt) * smoother(unit(T, 0.05, 0.6));
   story.slide = smoother(unit(T, 0.4, 1.0));
   story.fall = chain ? unit(T, T_IMPACT - chain.fallDur, T_IMPACT) : 0;
   canvas.style.transform = story.slide > 0 ? `translate3d(0, ${(-story.slide * vh).toFixed(1)}px, 0)` : '';
@@ -1279,7 +1430,7 @@ const updateStory = dt => {
   const mask = fadePx > 0 ? `linear-gradient(to bottom, #000 calc(100% - ${fadePx}px), transparent)` : '';
   canvas.style.webkitMaskImage = mask;
   canvas.style.maskImage = mask;
-  cue.style.opacity = String(clamp(1 - story.s * 6, 0, 1) * smoother(unit(state.intro, 0.6, 1)));
+  cue.style.opacity = String(clamp(1 - story.q * 6, 0, 1) * clamp(1 - story.dropT * 4, 0, 1) * smoother(unit(state.intro, 0.6, 1)));
 
   if (T >= T_IMPACT) {
     if (!story.impacted) startImpact();
@@ -1889,6 +2040,31 @@ const render = () => {
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, candleData, 0, candleCount * FLOATS);
   }
 
+  // タイトルの位置：視点から TITLE_DEPTH 前方。昇りきった高さは、タイトル用の俯角のとき画面の TITLE_NY に来るように
+  let titleDraw = null;
+  if (titleProgram && title.ready && title.t > 0) {
+    const rise = easeOut(unit(title.t, 0, TITLE_DUR));
+    const pT = (TITLE_TILT * Math.PI) / 180;
+    const lift = state.elevation * HEIGHT * state.rise * 0.18;
+    const clearance = state.elevation * HEIGHT * state.rise * 1.3 + 0.9;
+    const eyeY = lift + Math.sin(pT) * Math.max(ORBIT, (clearance - lift) / Math.sin(pT));
+    const k = TITLE_NY * lens(view.width / view.height);
+    const y1 = eyeY + (TITLE_DEPTH * (k * Math.cos(pT) - Math.sin(pT))) / (Math.cos(pT) + k * Math.sin(pT));
+    const cw = Math.max(1, container.clientWidth);
+    const ch = Math.max(1, container.clientHeight);
+    const wPx = cw < 640 ? cw * 0.86 : Math.min(cw * 0.5, 940);
+    if (title.t >= TITLE_DUR * 0.8) {
+      if (title.doneAt === null) title.doneAt = state.clock;
+    } else title.doneAt = null;
+    titleDraw = {
+      center: [cam.eye[0] + Math.sin(BASE_YAW) * TITLE_DEPTH, y1 - (1 - rise) * 3.4, cam.eye[2] + Math.cos(BASE_YAW) * TITLE_DEPTH],
+      halfW: wPx / cw,
+      halfH: wPx / title.aspect / ch,
+      alpha: smoother(unit(title.t, 0, TITLE_DUR * 0.45)),
+      sweep: title.doneAt === null ? -3 : ((state.clock - title.doneAt) % 7) * 0.9 - 0.45
+    };
+  }
+
   gl.bindVertexArray(vao);
   if (fieldProgram) {
     const width = layout.columns + 7;
@@ -1976,6 +2152,32 @@ const render = () => {
       gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, candleCount);
       gl.disable(gl.BLEND);
       gl.bindVertexArray(vao);
+    }
+
+    // タイトル：手前の山と K 線に隠れる（同じ深度バッファ）。ぼかし用の縮小パスでは控えめに
+    if (titleDraw) {
+      const glowPass = stride > 1;
+      gl.useProgram(titleProgram.program);
+      const t = titleProgram.uniforms;
+      gl.uniformMatrix4fv(t.uViewProj, false, matrix);
+      gl.uniform3fv(t.uCenter, titleDraw.center);
+      gl.depthFunc(gl.LESS);
+      gl.depthMask(false);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.uniform1f(t.uMode, 1);
+      gl.uniform2f(t.uHalf, titleDraw.halfW * 1.25, titleDraw.halfH * 3.4);
+      gl.uniform1f(t.uAlpha, 0.16 * titleDraw.alpha * (glowPass ? 0.6 : 1));
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      bind(0, titleTex);
+      gl.uniform1i(t.uTex, 0);
+      gl.uniform1f(t.uMode, 0);
+      gl.uniform2f(t.uHalf, titleDraw.halfW, titleDraw.halfH);
+      gl.uniform1f(t.uAlpha, titleDraw.alpha * (glowPass ? 0.28 : 1));
+      gl.uniform1f(t.uSweep, titleDraw.sweep);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.disable(gl.BLEND);
+      gl.depthMask(true);
     }
     gl.disable(gl.DEPTH_TEST);
   };
@@ -2264,6 +2466,8 @@ const toTop = () => {
   story.q = 0;
   story.dir = -1;
   story.dropT = 0;
+  title.t = 0;
+  title.dir = -1;
   fly.boost = 0;
 };
 window.addEventListener('scroll', toTop, { passive: true });
