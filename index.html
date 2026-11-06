@@ -1,0 +1,2279 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>html, body { margin: 0; padding: 0; } body { font: 14px/1.5 system-ui, -apple-system, sans-serif; }</style>
+<title>夜间行情地形图</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Zen+Kaku+Gothic+New:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #04060d;
+    --bg-deep: #0a1230;
+    --ink: #c9d4ff;
+    --label: #8fa6ff;
+    --green: #2cf0a0;
+    color-scheme: dark;
+  }
+  html, body { background: var(--bg); color: var(--ink); }
+  .scroller { position: relative; height: calc(100svh * 2.6); }
+  .stage {
+    position: sticky;
+    top: 0;
+    height: 100svh;
+    min-height: 420px;
+    overflow: hidden;
+    background: radial-gradient(130% 90% at 50% 115%, var(--bg-deep) 0%, var(--bg) 62%);
+    cursor: crosshair;
+  }
+  #terrain, #fx { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #terrain { will-change: transform; }
+  #fx { pointer-events: none; }
+
+  .cue {
+    position: absolute;
+    left: 50%;
+    bottom: max(22px, env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%);
+    display: grid;
+    justify-items: center;
+    gap: 10px;
+    font: 500 10px/1 "IBM Plex Mono", ui-monospace, monospace;
+    letter-spacing: 0.32em;
+    color: var(--label);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .cue i { width: 1px; height: 34px; background: linear-gradient(var(--label), transparent); transform-origin: top; animation: cue 2.2s cubic-bezier(.6,0,.2,1) infinite; }
+  @keyframes cue { 0% { transform: scaleY(0); } 45% { transform: scaleY(1); } 100% { transform: scaleY(1); opacity: 0; } }
+
+  /* 第2ページ：割れ目にできた空き。中身はあとで入れる */
+  .slot {
+    position: absolute;
+    left: 50%;
+    top: 0;
+    bottom: 0;
+    width: min(38vw, 680px);
+    transform: translateX(-50%);
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: max(9vh, 48px) 48px;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    justify-items: center;
+    opacity: 0;
+    pointer-events: none;
+  }
+  .slot-label {
+    display: grid;
+    justify-items: center;
+    gap: 12px;
+    font: 500 11px/1 "IBM Plex Mono", ui-monospace, monospace;
+    letter-spacing: 0.24em;
+    color: var(--label);
+    white-space: nowrap;
+  }
+  .slot-label b { font: 700 13px/1 "Zen Kaku Gothic New", "Hiragino Sans", sans-serif; letter-spacing: 0.18em; color: var(--ink); }
+  .slot-label i { width: 1px; height: 40px; background: linear-gradient(var(--green), transparent); }
+  @media (max-width: 640px) { .slot { width: 62vw; } }
+
+  .fallback {
+    position: absolute; inset: 0; display: none; place-items: center;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    font: 14px/1.6 "IBM Plex Mono", ui-monospace, monospace; text-align: center;
+  }
+  .stage.no-gl .fallback { display: grid; }
+</style>
+</head>
+<body>
+
+<main class="scroller">
+  <div class="stage" id="stage">
+    <canvas id="terrain" aria-label="等高線の山並みのあいだを、赤と緑のローソク足が鳥の飛ぶ軌跡のように上下しながら流れていく"></canvas>
+    <canvas id="fx" aria-hidden="true"></canvas>
+    <div class="cue" id="cue" aria-hidden="true">SCROLL<i></i></div>
+    <section class="slot" id="slot" aria-label="実験の方向">
+      <div class="slot-label"><span>02</span><b>実験の方向</b><i></i></div>
+      <div class="slot-body"></div>
+    </section>
+    <p class="fallback">このブラウザは WebGL2 に対応していないため、地形を表示できません。</p>
+  </div>
+</main>
+
+<script>
+/* 地形部分：React Bits「Topography」(DavidHDev/react-bits, MIT + Commons Clause) の WebGL2 コードを
+   React なしで動くように移植。K線の飛行軌跡・大陰線・地割れは追加で実装。 */
+(() => {
+'use strict';
+const FOV = 0.32;
+const ORBIT = 9;
+const NEAR = 0.05;
+const FAR = 160;
+const HEIGHT = 1.7;
+const FREQUENCY = 0.45;
+const INTRO_SECONDS = 2.8;
+const MAX_PULSES = 4;
+const BLOOM_LEVELS = 4;
+const SCULPT_SIZE = 256;
+const SCULPT_SPAN = 48;
+const MAX_CELLS = 200000;
+const SUN = [-0.81, 0.58, -0.02];
+const DIRECTIONS = { forward: [0, 1], backward: [0, -1], left: [-1, 0], right: [1, 0] };
+const HOVER_EFFECTS = ['lift', 'trace', 'light'];
+const MARKER_STYLES = { plus: 0, dots: 1 };
+const MARKER_SPACING = 1.25;
+
+const COMMON = `
+precision highp float;
+precision highp int;
+
+uniform float uFrequency;
+uniform vec2 uMorph;
+uniform sampler2D uSculpt;
+uniform float uSculptOn;
+uniform vec4 uPulses[${MAX_PULSES}];
+uniform vec3 uEye;
+uniform vec3 uForward;
+uniform vec3 uNear;
+
+uint lattice(ivec2 p) {
+  uvec2 q = uvec2(p + 1073741824);
+  uint h = q.x * 2654435761u + q.y * 2246822519u;
+  h = (h ^ (h >> 15u)) * 739982445u;
+  h = (h ^ (h >> 12u)) * 695872825u;
+  return h ^ (h >> 15u);
+}
+
+float corner(ivec2 c, vec2 f) {
+  uint h = lattice(c);
+  vec2 g = vec2(float(h & 65535u), float(h >> 16u)) / 32767.5 - 1.0;
+  return dot(g, f);
+}
+
+float noise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = p - i;
+  ivec2 c = ivec2(i);
+  vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  float a = corner(c, f);
+  float b = corner(c + ivec2(1, 0), f - vec2(1.0, 0.0));
+  float d = corner(c + ivec2(0, 1), f - vec2(0.0, 1.0));
+  float e = corner(c + ivec2(1, 1), f - vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(d, e, u.x), u.y);
+}
+
+vec2 octave(vec2 p, vec2 shift) {
+  return vec2(1.6 * p.x - 1.2 * p.y, 1.2 * p.x + 1.6 * p.y) + shift;
+}
+
+float relief(vec2 t) {
+  vec2 p = t * uFrequency;
+  vec2 w = vec2(noise(p * 0.42 + uMorph), noise(p * 0.42 - uMorph.yx + vec2(5.2, 1.3)));
+  p += w * 0.8;
+  float n = noise(p) * 0.55;
+  p = octave(p, vec2(7.1, 3.7));
+  n += noise(p) * 0.15;
+  p = octave(p, vec2(1.9, 8.3));
+  n += noise(p) * 0.04;
+  float s = log(1.0 + exp(7.0 * (3.0 * n + 0.05))) / 7.0;
+  return s * s * 1.4 + 0.1 * n;
+}
+
+float swell(vec2 t) {
+  float lift = 0.0;
+  for (int i = 0; i < ${MAX_PULSES}; i++) {
+    vec4 p = uPulses[i];
+    if (p.w <= 0.0) continue;
+    float x = (length(t - p.xy) - p.z) / (0.28 + p.z * 0.05);
+    lift += exp(-x * x) * p.w;
+  }
+  return lift;
+}
+
+vec4 sculpted(vec2 t) {
+  return uSculptOn > 0.5 ? textureLod(uSculpt, t / ${SCULPT_SPAN}.0, 0.0) : vec4(0.0);
+}
+
+float settle(vec2 world) {
+  float depth = dot(vec3(world.x, 0.0, world.y) - uEye, uForward);
+  float x = clamp((depth - uNear.x) / max(uNear.y - uNear.x, 1e-3), 0.0, 1.0);
+  return mix(uNear.z, 1.0, x * x * x * (x * (x * 6.0 - 15.0) + 10.0));
+}
+`;
+
+const FIELD = `#version 300 es
+${COMMON}
+uniform ivec2 uBase;
+uniform float uCell;
+uniform float uDetail;
+layout(location = 0) out vec4 outField;
+layout(location = 1) out vec4 outHeight;
+
+void main() {
+  vec2 t = vec2(uBase + ivec2(gl_FragCoord.xy)) * uCell;
+  vec4 carved = sculpted(t);
+  float ring = swell(t);
+  float ground = relief(t) + carved.r + ring * 0.14;
+  vec2 dp = t * uFrequency * 5.0 + vec2(13.1, 4.7);
+  float fine = noise(dp) * 0.6 + noise(octave(dp, vec2(2.3, 6.1))) * 0.3;
+  outField = vec4(carved.g, ring, ground, carved.r);
+  outHeight = vec4(ground + uDetail * 0.1 * fine, 0.0, 0.0, 1.0);
+}`;
+
+const terrainVertex = baked => `#version 300 es
+#define BAKED ${baked ? 1 : 0}
+${COMMON}
+uniform sampler2D uField;
+uniform ivec2 uOrigin;
+uniform ivec2 uCamCell;
+uniform vec2 uCamFrac;
+uniform float uCell;
+uniform int uStride;
+uniform float uHeight;
+uniform mat4 uViewProj;
+out vec2 vTexel;
+out vec2 vTerrain;
+out float vDepth;
+out float vLift;
+out vec3 vNormal;
+
+float ground(vec2 t) {
+  return relief(t) + swell(t) * 0.14;
+}
+
+void main() {
+  ivec2 step = ivec2(gl_VertexID >> 1, gl_InstanceID + (gl_VertexID & 1)) * uStride;
+  ivec2 local = uOrigin + step;
+  vec2 terrain = vec2(local + uCamCell) * uCell;
+  vec2 world = vec2(local) * uCell - uCamFrac;
+  float k = settle(world);
+#if BAKED
+  ivec2 texel = step + 2;
+  vec4 c = texelFetch(uField, texel, 0);
+  vec4 l = texelFetch(uField, texel - ivec2(1, 0), 0);
+  vec4 r = texelFetch(uField, texel + ivec2(1, 0), 0);
+  vec4 d = texelFetch(uField, texel - ivec2(0, 1), 0);
+  vec4 u = texelFetch(uField, texel + ivec2(0, 1), 0);
+  float h = (c.b - c.a) * k + c.a;
+  float dx = (l.b - l.a - r.b + r.a) * k + l.a - r.a;
+  float dz = (d.b - d.a - u.b + u.a) * k + d.a - u.a;
+  vNormal = vec3(dx * uHeight / (2.0 * uCell), 1.0, dz * uHeight / (2.0 * uCell));
+  vTexel = vec2(texel) + 0.5;
+#else
+  float h = ground(terrain) * k;
+  float hx = ground(terrain + vec2(0.04, 0.0)) * k;
+  float hz = ground(terrain + vec2(0.0, 0.04)) * k;
+  vNormal = vec3((h - hx) * uHeight / 0.04, 1.0, (h - hz) * uHeight / 0.04);
+  vTexel = vec2(0.0);
+#endif
+  vec4 clip = uViewProj * vec4(world.x, h * uHeight, world.y, 1.0);
+  gl_Position = clip;
+  vTerrain = terrain;
+  vDepth = clip.w;
+  vLift = h * uHeight;
+}`;
+
+const terrainFragment = baked => `#version 300 es
+#define BAKED ${baked ? 1 : 0}
+${COMMON}
+uniform sampler2D uField;
+uniform highp sampler2D uHeightField;
+uniform float uDetail;
+uniform float uLines;
+uniform float uLineWidth;
+uniform float uMajor;
+uniform vec3 uColor;
+uniform float uBrightness;
+uniform vec2 uFade;
+uniform vec3 uFocus;
+uniform vec4 uHeat;
+uniform vec4 uLamp;
+uniform vec4 uTrace;
+uniform vec3 uSun;
+uniform float uRefDepth;
+uniform float uReveal;
+uniform float uLightMode;
+uniform float uOpacity;
+uniform vec4 uGlitch[3];
+uniform float uGlitchSeed;
+uniform float uPixel;
+in vec2 vTexel;
+in vec2 vTerrain;
+in float vDepth;
+in float vLift;
+in vec3 vNormal;
+out vec4 outColor;
+
+float smoother(float x) {
+  x = clamp(x, 0.0, 1.0);
+  return x * x * x * (x * (x * 6.0 - 15.0) + 10.0);
+}
+
+float stroke(float dist, float width, float soft, float density, float crowd) {
+  float cover = max(0.0, min(min(width, soft), 0.5 * (width + soft) - dist)) / soft;
+  return mix(cover, min(width * density, 1.0) * 0.6, crowd);
+}
+
+float sampleHeight(vec2 coord, out vec2 slope) {
+  vec2 u = coord - 0.5;
+  vec2 i = floor(u + 0.5);
+  vec2 f = u - i;
+  vec3 wx = vec3(0.5 * (0.5 - f.x) * (0.5 - f.x), 0.75 - f.x * f.x, 0.5 * (0.5 + f.x) * (0.5 + f.x));
+  vec3 wy = vec3(0.5 * (0.5 - f.y) * (0.5 - f.y), 0.75 - f.y * f.y, 0.5 * (0.5 + f.y) * (0.5 + f.y));
+  vec3 dx = vec3(f.x - 0.5, -2.0 * f.x, 0.5 + f.x);
+  vec3 dy = vec3(f.y - 0.5, -2.0 * f.y, 0.5 + f.y);
+  ivec2 base = ivec2(i) - 1;
+  float total = 0.0;
+  slope = vec2(0.0);
+  for (int y = 0; y < 3; y++) {
+    float a = texelFetch(uHeightField, base + ivec2(0, y), 0).r;
+    float b = texelFetch(uHeightField, base + ivec2(1, y), 0).r;
+    float c = texelFetch(uHeightField, base + ivec2(2, y), 0).r;
+    float row = a * wx.x + b * wx.y + c * wx.z;
+    total += row * wy[y];
+    slope += vec2((a * dx.x + b * dx.y + c * dx.z) * wy[y], row * dy[y]);
+  }
+  return total;
+}
+
+void main() {
+  float py = gl_FragCoord.y / uPixel;
+  float shift = 0.0;
+  float split = 0.0;
+  for (int i = 0; i < 3; i++) {
+    if (py >= uGlitch[i].x && py < uGlitch[i].y) {
+      shift = uGlitch[i].z * uPixel;
+      split = uGlitch[i].w * uPixel;
+    }
+  }
+  vec2 spot = vTerrain - dFdx(vTerrain) * shift;
+#if BAKED
+  vec2 ex = dFdx(vTexel);
+  vec2 ey = dFdy(vTexel);
+  vec2 coord = vTexel - ex * shift;
+  vec2 slope;
+  float h = sampleHeight(coord, slope);
+  vec4 field = texture(uField, coord / vec2(textureSize(uField, 0)));
+  float trail = field.r;
+  float ring = field.g;
+  float gx = dot(slope, ex) * uLines;
+  float gy = dot(slope, ey) * uLines;
+#else
+  vec2 dp = spot * uFrequency * 5.0 + vec2(13.1, 4.7);
+  float ring = swell(spot);
+  float h = relief(spot) + ring * 0.14 + uDetail * 0.1 * (noise(dp) * 0.6 + noise(octave(dp, vec2(2.3, 6.1))) * 0.3);
+  float trail = 0.0;
+  float gx = dFdx(h) * uLines;
+  float gy = dFdy(h) * uLines;
+#endif
+
+  float lc = h * uLines + 0.5;
+  float density = max(sqrt(gx * gx + gy * gy), 1e-5);
+  float dist = abs(fract(lc + 0.5) - 0.5) / density;
+  float major = uMajor * (1.0 - step(0.5, mod(floor(lc + 0.5), 5.0)));
+
+  vec2 hd = spot - uHeat.xy;
+  float heat = exp(-dot(hd, hd) / (uHeat.z * uHeat.z)) * uHeat.w + trail * 0.6;
+  float energy = heat + ring;
+
+  float depth = max(vDepth, 0.01);
+  float persp = clamp(sqrt(uRefDepth / depth), 0.6, 1.6);
+  float width = uLineWidth * persp * (1.0 + 0.6 * major) * (1.0 + 0.45 * min(energy, 1.5));
+  float soft = 1.0 + min(uFocus.y * abs(1.0 - uFocus.x / depth), uFocus.z);
+  float crowd = smoothstep(0.3, 0.75, density * max(width, soft));
+  float cover = stroke(dist, width, soft, density, crowd);
+  vec3 cover3 = vec3(cover);
+  if (split > 0.0) {
+    float offset = split * density;
+    cover3.r = stroke(abs(fract(lc + offset + 0.5) - 0.5) / density, width, soft, density, crowd);
+    cover3.b = stroke(abs(fract(lc - offset + 0.5) - 0.5) / density, width, soft, density, crowd);
+    vec2 block = floor(vec2(gl_FragCoord.x / (uPixel * 26.0), py / 5.0)) + uGlitchSeed * 71.0;
+    float drop = fract(sin(dot(block, vec2(12.9898, 78.233))) * 43758.5453);
+    cover3 *= drop > 0.82 ? 0.1 : 1.2;
+  }
+
+  vec3 normal = normalize(vNormal);
+  float sun = clamp(dot(normal, uSun), 0.0, 1.0);
+  vec3 toLamp = uLamp.xyz - vec3(vTerrain.x, vLift, vTerrain.y);
+  float lampDistance = length(toLamp);
+  float lamp = clamp(dot(normal, toLamp / max(lampDistance, 1e-3)), 0.0, 1.0) * uLamp.w / (1.0 + lampDistance * lampDistance * 0.9);
+  float level = mix(0.45, 1.05, smoothstep(0.0, 1.1, h)) * mix(0.35, 1.25, sun * sun) * (1.0 + 0.6 * major);
+  level += heat * 1.4 + ring * 3.0 + lamp * 1.2;
+
+  float fade = 1.0 - smoother((depth - uFade.x) / max(uFade.y - uFade.x, 1e-3));
+  vec3 light = cover3 * level;
+
+  if (uTrace.y > 0.0) {
+    float traceWidth = uLineWidth * persp * 1.8;
+    float trace = stroke(abs(h - uTrace.x) * uLines / density, traceWidth, soft, density, crowd);
+    vec2 td = spot - uTrace.zw;
+    light += trace * uTrace.y * mix(0.35, 1.0, exp(-dot(td, td) / 20.0)) * 2.6;
+  }
+  light *= fade * uBrightness * uReveal;
+
+  if (uLightMode > 0.5) {
+    float ink = (1.0 - exp(-max(max(light.r, light.g), light.b) * 1.8)) * 0.92 * uOpacity;
+    outColor = vec4(uColor * ink, ink);
+    return;
+  }
+
+  vec3 color = 1.0 - exp(-uColor * light * 1.8);
+  float top = max(max(color.r, color.g), color.b);
+  float dither = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+  color = max(color + dither / 255.0 * step(0.002, top), 0.0);
+  outColor = vec4(color, max(max(color.r, color.g), color.b)) * uOpacity;
+}`;
+
+const MARKER_VERTEX = `#version 300 es
+${COMMON}
+uniform ivec2 uOrigin;
+uniform ivec2 uCamCell;
+uniform vec2 uCamFrac;
+uniform float uSpacing;
+uniform int uColumns;
+uniform float uHeight;
+uniform mat4 uViewProj;
+uniform vec2 uView;
+uniform float uSize;
+uniform float uRefDepth;
+uniform vec4 uHeat;
+uniform float uTime;
+uniform vec4 uGlitch[3];
+uniform float uPixel;
+out vec2 vCorner;
+out float vSize;
+out float vGlow;
+out float vFrame;
+out float vDepth;
+
+void main() {
+  ivec2 local = uOrigin + ivec2(gl_InstanceID % uColumns, gl_InstanceID / uColumns);
+  ivec2 id = local + uCamCell;
+  vec2 terrain = vec2(id) * uSpacing;
+  vec2 world = vec2(local) * uSpacing - uCamFrac;
+  float ring = swell(terrain);
+  float h = (relief(terrain) + ring * 0.14) * settle(world) + sculpted(terrain).r;
+  vec4 clip = uViewProj * vec4(world.x, h * uHeight + 0.05, world.y, 1.0);
+  uint seed = lattice(id + ivec2(911, 377));
+  float a = float(seed & 1023u) / 1023.0;
+  float b = float((seed >> 10u) & 1023u) / 1023.0;
+  vec2 hd = terrain - uHeat.xy;
+  float heat = exp(-dot(hd, hd) / (uHeat.z * uHeat.z)) * uHeat.w;
+  float blink = step(0.92, a) * (0.5 + 0.5 * sin(uTime * (1.4 + b * 2.2) + b * 40.0));
+  float size = uSize * clamp(sqrt(uRefDepth / max(clip.w, 0.01)), 0.6, 1.3) * (1.0 + 0.4 * heat + 0.35 * blink);
+  float frame = max(smoothstep(0.55, 0.95, blink), smoothstep(0.3, 0.8, heat));
+  vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1)) * 2.0 - 1.0;
+  vec2 offset = corner * (size * (frame > 0.001 ? 2.6 : 1.0) + 1.5);
+  float py = (clip.y / clip.w * 0.5 + 0.5) * uView.y / uPixel;
+  float shift = 0.0;
+  for (int i = 0; i < 3; i++) {
+    if (py >= uGlitch[i].x && py < uGlitch[i].y) shift = uGlitch[i].z;
+  }
+  clip.xy += (offset + vec2(shift * uPixel, 0.0)) / uView * 2.0 * clip.w;
+  gl_Position = clip;
+  vCorner = offset;
+  vSize = size;
+  vFrame = frame;
+  vGlow = 0.5 + 0.4 * b + blink * 0.9 + heat * 1.8 + ring * 3.0;
+  vDepth = clip.w;
+}`;
+
+const MARKER_FRAGMENT = `#version 300 es
+precision highp float;
+uniform vec3 uColor;
+uniform vec2 uFade;
+uniform float uReveal;
+uniform float uBrightness;
+uniform float uLightMode;
+uniform float uOpacity;
+uniform float uStyle;
+uniform float uPixel;
+in vec2 vCorner;
+in float vSize;
+in float vGlow;
+in float vFrame;
+in float vDepth;
+out vec4 outColor;
+
+float smoother(float x) {
+  x = clamp(x, 0.0, 1.0);
+  return x * x * x * (x * (x * 6.0 - 15.0) + 10.0);
+}
+
+void main() {
+  vec2 a = abs(vCorner);
+  float cover;
+  if (uStyle < 0.5) {
+    float thick = max(0.6 * uPixel, 0.5);
+    float across = clamp(vSize - a.x + 0.5, 0.0, 1.0) * clamp(thick - a.y + 0.5, 0.0, 1.0);
+    float down = clamp(vSize - a.y + 0.5, 0.0, 1.0) * clamp(thick - a.x + 0.5, 0.0, 1.0);
+    cover = max(across, down);
+  } else {
+    cover = clamp(vSize * 0.42 - length(vCorner) + 0.5, 0.0, 1.0);
+  }
+  if (vFrame > 0.001) {
+    float edge = vSize * 2.3;
+    float reach = edge * 0.45;
+    float line = max(0.5 * uPixel, 0.5);
+    float sides = clamp(line - abs(a.x - edge) + 0.5, 0.0, 1.0) * clamp(a.y - edge + reach + 0.5, 0.0, 1.0) * clamp(edge + line - a.y + 0.5, 0.0, 1.0);
+    float caps = clamp(line - abs(a.y - edge) + 0.5, 0.0, 1.0) * clamp(a.x - edge + reach + 0.5, 0.0, 1.0) * clamp(edge + line - a.x + 0.5, 0.0, 1.0);
+    cover = max(cover, max(sides, caps) * vFrame * 0.8);
+  }
+  float fade = 1.0 - smoother((vDepth - uFade.x) / max(uFade.y - uFade.x, 1e-3));
+  float light = cover * vGlow * fade * fade * uReveal * uBrightness;
+  if (uLightMode > 0.5) {
+    float ink = (1.0 - exp(-light * 1.8)) * 0.92 * uOpacity;
+    outColor = vec4(uColor * ink, ink);
+    return;
+  }
+  vec3 color = 1.0 - exp(-uColor * light * 1.8);
+  outColor = vec4(color, max(max(color.r, color.g), color.b)) * uOpacity;
+}`;
+
+const FULLSCREEN = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const SCULPT = `#version 300 es
+precision highp float;
+uniform sampler2D uPrevious;
+uniform vec4 uSegment;
+uniform vec4 uBrush;
+uniform vec4 uBurst;
+uniform vec2 uDecay;
+out vec4 outColor;
+
+vec2 wrapped(vec2 d) {
+  return d - ${SCULPT_SPAN}.0 * floor(d / ${SCULPT_SPAN}.0 + 0.5);
+}
+
+void main() {
+  vec4 previous = texelFetch(uPrevious, ivec2(gl_FragCoord.xy), 0);
+  vec2 t = gl_FragCoord.xy / ${SCULPT_SIZE}.0 * ${SCULPT_SPAN}.0;
+  vec2 a = wrapped(t - uSegment.xy);
+  vec2 ab = uSegment.zw - uSegment.xy;
+  float k = clamp(dot(a, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+  vec2 d = a - ab * k;
+  float g = exp(-dot(d, d) / (uBrush.x * uBrush.x)) * uBrush.w;
+  float height = previous.r * uDecay.x;
+  height += (uBrush.y - height) * g * uBrush.z;
+  float heat = previous.g * uDecay.y;
+  heat += (1.0 - heat) * g * uBrush.z;
+  vec2 b = wrapped(t - uBurst.xy);
+  height += uBurst.w * exp(-dot(b, b) / (uBurst.z * uBurst.z));
+  outColor = vec4(height, heat, 0.0, 1.0);
+}`;
+
+const DOWNSAMPLE = `#version 300 es
+precision highp float;
+uniform sampler2D uSource;
+uniform vec2 uTarget;
+uniform vec2 uTexel;
+out vec4 outColor;
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / uTarget;
+  vec4 color = texture(uSource, uv - uTexel);
+  color += texture(uSource, uv + uTexel);
+  color += texture(uSource, uv + vec2(uTexel.x, -uTexel.y));
+  color += texture(uSource, uv + vec2(-uTexel.x, uTexel.y));
+  outColor = min(color * 0.25, vec4(1.0));
+}`;
+
+const BLUR = `#version 300 es
+precision highp float;
+uniform sampler2D uSource;
+uniform vec2 uTarget;
+uniform vec2 uStep;
+out vec4 outColor;
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / uTarget;
+  vec4 color = texture(uSource, uv) * 0.181862;
+  color += (texture(uSource, uv + uStep * 1.423135) + texture(uSource, uv - uStep * 1.423135)) * 0.284316;
+  color += (texture(uSource, uv + uStep * 3.326702) + texture(uSource, uv - uStep * 3.326702)) * 0.106598;
+  color += (texture(uSource, uv + uStep * 5.242989) + texture(uSource, uv - uStep * 5.242989)) * 0.018156;
+  outColor = color;
+}`;
+
+const COMPOSITE = `#version 300 es
+precision highp float;
+uniform sampler2D uBloom0;
+uniform sampler2D uBloom1;
+uniform sampler2D uBloom2;
+uniform sampler2D uBloom3;
+uniform vec2 uView;
+uniform float uGlow;
+uniform float uLightMode;
+out vec4 outColor;
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / uView;
+  vec4 halo = texture(uBloom0, uv) * 0.4;
+  halo += texture(uBloom1, uv) * 0.3;
+  halo += texture(uBloom2, uv) * 0.2;
+  halo += texture(uBloom3, uv) * 0.1;
+  if (uLightMode > 0.5) {
+    outColor = halo * uGlow * 0.35;
+    return;
+  }
+  vec3 color = halo.rgb * uGlow * 1.6;
+  color = color / (1.0 + color);
+  outColor = vec4(color, max(max(color.r, color.g), color.b));
+}`;
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+const smoother = x => {
+  const t = clamp(x, 0, 1);
+  return t * t * t * (t * (t * 6 - 15) + 10);
+};
+
+const lattice = (x, y) => {
+  let h = (Math.imul(x + 1073741824, 2654435761) + Math.imul(y + 1073741824, 2246822519)) >>> 0;
+  h = Math.imul(h ^ (h >>> 15), 739982445) >>> 0;
+  h = Math.imul(h ^ (h >>> 12), 695872825) >>> 0;
+  return (h ^ (h >>> 15)) >>> 0;
+};
+
+const corner = (cx, cy, fx, fy) => {
+  const h = lattice(cx, cy);
+  return ((h & 65535) / 32767.5 - 1) * fx + ((h >>> 16) / 32767.5 - 1) * fy;
+};
+
+const noise = (x, y) => {
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  const fx = x - ix;
+  const fy = y - iy;
+  const ux = fx * fx * fx * (fx * (fx * 6 - 15) + 10);
+  const uy = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
+  const a = corner(ix, iy, fx, fy);
+  const b = corner(ix + 1, iy, fx - 1, fy);
+  const d = corner(ix, iy + 1, fx, fy - 1);
+  const e = corner(ix + 1, iy + 1, fx - 1, fy - 1);
+  const top = a + (b - a) * ux;
+  return top + (d + (e - d) * ux - top) * uy;
+};
+
+const relief = (tx, tz, frequency, morphX, morphZ) => {
+  let px = tx * frequency;
+  let pz = tz * frequency;
+  const wx = noise(px * 0.42 + morphX, pz * 0.42 + morphZ);
+  const wz = noise(px * 0.42 - morphZ + 5.2, pz * 0.42 - morphX + 1.3);
+  px += wx * 0.8;
+  pz += wz * 0.8;
+  let n = noise(px, pz) * 0.55;
+  const qx = 1.6 * px - 1.2 * pz + 7.1;
+  const qz = 1.2 * px + 1.6 * pz + 3.7;
+  n += noise(qx, qz) * 0.15;
+  n += noise(1.6 * qx - 1.2 * qz + 1.9, 1.2 * qx + 1.6 * qz + 8.3) * 0.04;
+  const s = Math.log(1 + Math.exp(7 * (3 * n + 0.05))) / 7;
+  return s * s * 1.4 + 0.1 * n;
+};
+
+const fineDetail = (tx, tz, frequency) => {
+  const px = tx * frequency * 5 + 13.1;
+  const pz = tz * frequency * 5 + 4.7;
+  return noise(px, pz) * 0.6 + noise(1.6 * px - 1.2 * pz + 2.3, 1.2 * px + 1.6 * pz + 6.1) * 0.3;
+};
+
+const compile = (gl, type, source) => {
+  const shader = gl.createShader(type);
+  if (!shader) return null;
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (gl.getShaderParameter(shader, gl.COMPILE_STATUS)) return shader;
+  gl.deleteShader(shader);
+  return null;
+};
+
+const link = (gl, vertexSource, fragmentSource) => {
+  const vertex = compile(gl, gl.VERTEX_SHADER, vertexSource);
+  const fragment = compile(gl, gl.FRAGMENT_SHADER, fragmentSource);
+  const program = gl.createProgram();
+  if (!vertex || !fragment || !program) return null;
+  gl.attachShader(program, vertex);
+  gl.attachShader(program, fragment);
+  gl.linkProgram(program);
+  gl.deleteShader(vertex);
+  gl.deleteShader(fragment);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    gl.deleteProgram(program);
+    return null;
+  }
+  const uniforms = {};
+  const total = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < total; i++) {
+    const info = gl.getActiveUniform(program, i);
+    if (info) uniforms[info.name.replace(/\[0\]$/, '')] = gl.getUniformLocation(program, info.name);
+  }
+  return { program, uniforms };
+};
+
+const toRgb = hex => {
+  let h = String(hex || '#ffffff')
+    .replace('#', '')
+    .trim();
+  if (h.length === 3 || h.length === 4)
+    h = h
+      .slice(0, 3)
+      .split('')
+      .map(c => c + c)
+      .join('');
+  const num = parseInt(h.slice(0, 6), 16);
+  if (Number.isNaN(num)) return [1, 1, 1];
+  return [((num >> 16) & 255) / 255, ((num >> 8) & 255) / 255, (num & 255) / 255];
+};
+
+const orient = (yaw, pitch) => {
+  const cp = Math.cos(pitch);
+  const f = [Math.sin(yaw) * cp, -Math.sin(pitch), Math.cos(yaw) * cp];
+  const r = [Math.cos(yaw), 0, -Math.sin(yaw)];
+  const u = [f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0]];
+  return { f, r, u };
+};
+
+const lens = aspect => clamp(0.4877 / aspect, FOV, 0.6);
+
+const viewProjection = ({ eye, f, r, u }, aspect, out) => {
+  const t = 1 / lens(aspect);
+  const nf = 1 / (NEAR - FAR);
+  const view = [
+    r[0],
+    u[0],
+    -f[0],
+    0,
+    r[1],
+    u[1],
+    -f[1],
+    0,
+    r[2],
+    u[2],
+    -f[2],
+    0,
+    -(r[0] * eye[0] + r[1] * eye[1] + r[2] * eye[2]),
+    -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]),
+    f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2],
+    1
+  ];
+  const projection = [t / aspect, 0, 0, 0, 0, t, 0, 0, 0, 0, (FAR + NEAR) * nf, -1, 0, 0, 2 * FAR * NEAR * nf, 0];
+  for (let c = 0; c < 4; c++) {
+    for (let row = 0; row < 4; row++) {
+      let sum = 0;
+      for (let k = 0; k < 4; k++) sum += projection[k * 4 + row] * view[c * 4 + k];
+      out[c * 4 + row] = sum;
+    }
+  }
+  return out;
+};
+
+/* ---------- K線（追加部分） ---------- */
+const CANDLE_VERTEX = `#version 300 es
+precision highp float;
+layout(location = 0) in vec4 aPos;    // x, y(ゆらぎ), z, 幅
+layout(location = 1) in vec4 aShape;  // 安値, 高値, 実体下, 実体上（絶対高さ）
+layout(location = 2) in vec4 aColor;  // rgb, 明るさ
+layout(location = 3) in vec4 aExtra;  // 不透明度, 先頭の白熱
+uniform mat4 uViewProj;
+uniform vec3 uRight;
+out vec2 vLocal;
+out vec4 vShape;
+out vec4 vColor;
+out vec4 vExtra;
+out float vDepth;
+
+void main() {
+  vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1)) * 2.0 - 1.0;
+  float y = mix(aShape.x, aShape.y, corner.y * 0.5 + 0.5);
+  vec3 p = vec3(aPos.x, aPos.y + y, aPos.z) + uRight * corner.x * aPos.w * 0.5;
+  vec4 clip = uViewProj * vec4(p, 1.0);
+  gl_Position = clip;
+  vLocal = vec2(corner.x, y);
+  vShape = aShape;
+  vColor = aColor;
+  vExtra = aExtra;
+  vDepth = clip.w;
+}`;
+
+const CANDLE_FRAGMENT = `#version 300 es
+precision highp float;
+uniform vec2 uFade;
+uniform float uReveal;
+in vec2 vLocal;
+in vec4 vShape;
+in vec4 vColor;
+in vec4 vExtra;
+in float vDepth;
+out vec4 outColor;
+
+float smoother(float x) {
+  x = clamp(x, 0.0, 1.0);
+  return x * x * x * (x * (x * 6.0 - 15.0) + 10.0);
+}
+
+void main() {
+  float ax = abs(vLocal.x);
+  float y = vLocal.y;
+  float aaX = fwidth(vLocal.x);
+  float aaY = max(fwidth(y), 1e-4);
+  float bx = 1.0 - smoothstep(1.0 - aaX * 1.5, 1.0, ax);
+  float by = smoothstep(vShape.z - aaY, vShape.z + aaY, y) * (1.0 - smoothstep(vShape.w - aaY, vShape.w + aaY, y));
+  float body = bx * by;
+  float ww = max(0.13, aaX * 0.75);
+  float wx = 1.0 - smoothstep(ww - aaX, ww + aaX, ax);
+  float wy = smoothstep(vShape.x - aaY, vShape.x + aaY, y) * (1.0 - smoothstep(vShape.y - aaY, vShape.y + aaY, y));
+  float cover = max(body, wx * wy * 0.85);
+  if (cover < 0.04) discard;
+  float edge = smoothstep(0.5, 1.0, ax) * body;
+  vec3 col = vColor.rgb * vColor.a * (0.8 + 0.55 * edge);
+  col = mix(col, vec3(1.0), (0.16 + 0.5 * vExtra.y) * body * (1.0 - edge));
+  float fade = 1.0 - smoother((vDepth - uFade.x) / max(uFade.y - uFade.x, 1e-3));
+  float a = cover * fade * uReveal * vExtra.x;
+  outColor = vec4(col * a, a);
+}`;
+
+const S = {
+  color: '#4f7cff',
+  lineCount: 22,
+  lineWidth: 1.2,
+  majorLines: true,
+  elevation: 1.3,
+  foreground: 0.2,
+  scale: 1,
+  detail: 0.35,
+  tilt: 28,
+  speed: 0.25,
+  direction: [0, 1],
+  morph: 0.2,
+  glow: 0.75,
+  depthOfField: 0.4,
+  fog: 0.35,
+  brightness: 1,
+  opacity: 1,
+  mouseInteraction: true,
+  hoverEffect: 'trace',
+  mouseRadius: 1,
+  mouseStrength: 0.6,
+  trail: 0.3,
+  parallax: 0.5,
+  clickEffect: 'pulse',
+  intro: true,
+  lightMode: false
+};
+
+const stage = document.getElementById('stage');
+const container = stage;
+const canvas = document.getElementById('terrain');
+const startRatio = Math.min(window.devicePixelRatio || 1, 2);
+const gl = canvas.getContext('webgl2', {
+  alpha: true,
+  premultipliedAlpha: true,
+  antialias: startRatio < 1.5,
+  depth: true,
+  stencil: false,
+  powerPreference: 'high-performance'
+});
+if (!gl) {
+  stage.classList.add('no-gl');
+  return;
+}
+
+const floatTargets = !!gl.getExtension('EXT_color_buffer_float');
+const terrain = link(gl, terrainVertex(floatTargets), terrainFragment(floatTargets));
+const fieldProgram = floatTargets ? link(gl, FULLSCREEN, FIELD) : null;
+const sculptProgram = floatTargets ? link(gl, FULLSCREEN, SCULPT) : null;
+const downProgram = link(gl, FULLSCREEN, DOWNSAMPLE);
+const blurProgram = link(gl, FULLSCREEN, BLUR);
+const compositeProgram = link(gl, FULLSCREEN, COMPOSITE);
+const candleProgram = link(gl, CANDLE_VERTEX, CANDLE_FRAGMENT);
+if (!terrain || !downProgram || !blurProgram || !compositeProgram || !candleProgram) {
+  stage.classList.add('no-gl');
+  return;
+}
+canvas.addEventListener('webglcontextlost', event => event.preventDefault());
+
+const vao = gl.createVertexArray();
+const format = floatTargets ? gl.RGBA16F : gl.RGBA8;
+
+/* K線のインスタンス用バッファ */
+const MAX_TRAIL = 90;
+const FLOATS = 16;
+const candleData = new Float32Array((MAX_TRAIL + 2) * FLOATS);
+let candleCount = 0;
+const candleVao = gl.createVertexArray();
+gl.bindVertexArray(candleVao);
+const candleBuffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, candleBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, candleData.byteLength, gl.DYNAMIC_DRAW);
+for (let i = 0; i < 4; i++) {
+  gl.enableVertexAttribArray(i);
+  gl.vertexAttribPointer(i, 4, gl.FLOAT, false, FLOATS * 4, i * 16);
+  gl.vertexAttribDivisor(i, 1);
+}
+gl.bindVertexArray(null);
+
+const createTexture = (width, height, internal, wrap) => {
+  const texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, internal, width, height);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+  return texture;
+};
+
+const createTarget = () => ({ texture: null, framebuffer: gl.createFramebuffer(), depth: null, width: 0, height: 0 });
+
+const allocate = (target, width, height, withDepth) => {
+  if (target.texture && target.width === width && target.height === height) return;
+  if (target.texture) gl.deleteTexture(target.texture);
+  target.texture = createTexture(width, height, format, gl.CLAMP_TO_EDGE);
+  target.width = width;
+  target.height = height;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target.texture, 0);
+  if (withDepth) {
+    if (!target.depth) target.depth = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, target.depth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, width, height);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, target.depth);
+  }
+};
+
+const source = createTarget();
+const levels = Array.from({ length: BLOOM_LEVELS }, () => [createTarget(), createTarget()]);
+const sculpt = sculptProgram
+  ? [0, 1].map(() => {
+      const texture = createTexture(SCULPT_SIZE, SCULPT_SIZE, gl.RG16F, gl.REPEAT);
+      const framebuffer = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      return { texture, framebuffer };
+    })
+  : null;
+const blank = createTexture(1, 1, gl.RGBA8, gl.REPEAT);
+const field = { texture: null, heights: null, framebuffer: gl.createFramebuffer(), width: 0, height: 0 };
+let sculptIndex = 0;
+
+const reserveField = (width, height) => {
+  if (field.texture && width <= field.width && height <= field.height) return;
+  if (field.texture) gl.deleteTexture(field.texture);
+  if (field.heights) gl.deleteTexture(field.heights);
+  field.width = Math.max(width, Math.ceil(field.width * 1.25), 64);
+  field.height = Math.max(height, Math.ceil(field.height * 1.25), 64);
+  field.texture = createTexture(field.width, field.height, gl.RGBA16F, gl.CLAMP_TO_EDGE);
+  field.heights = createTexture(field.width, field.height, gl.R32F, gl.CLAMP_TO_EDGE);
+  gl.bindTexture(gl.TEXTURE_2D, field.heights);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, field.framebuffer);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, field.texture, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, field.heights, 0);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+};
+
+const bind = (unit, texture) => {
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+};
+
+const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+const matrix = new Float32Array(16);
+const pulseData = new Float32Array(MAX_PULSES * 4);
+const glitchData = new Float32Array(12);
+const pulses = [];
+const pointer = { x: 0, y: 0, inside: false, speed: 0, t: 0 };
+const view = { width: 1, height: 1, ratio: 1, cell: 0.05, cellKey: '' };
+const state = {
+  intro: S.intro && !reduce ? 0 : 1,
+  rise: 1,
+  travelX: 0,
+  travelZ: 0,
+  morph: 0,
+  yaw: 0,
+  pitch: 0,
+  yawVelocity: 0,
+  pitchVelocity: 0,
+  presence: 0,
+  focus: ORBIT,
+  hit: null,
+  brushFrom: null,
+  sculptLife: 0,
+  burst: null,
+  level: 0,
+  trace: 0,
+  clock: 0,
+  tilt: S.tilt,
+  elevation: S.elevation,
+  scale: S.scale,
+  energy: 0
+};
+state.rise = smoother(state.intro);
+let raf = 0;
+let last = 0;
+let visible = true;
+
+const camera = () => {
+  const pitch = Math.min((state.tilt * Math.PI) / 180 + state.pitch, Math.PI / 2 - 1e-4);
+  const frame = orient(state.yaw, pitch);
+  const lift = state.elevation * HEIGHT * state.rise * 0.18;
+  const clearance = state.elevation * HEIGHT * state.rise * 1.3 + 0.9;
+  const distance = Math.max(ORBIT, (clearance - lift) / Math.sin(pitch));
+  return {
+    ...frame,
+    distance,
+    eye: [-frame.f[0] * distance, lift - frame.f[1] * distance, -frame.f[2] * distance]
+  };
+};
+
+const rayDirection = (cam, nx, ny) => {
+  const aspect = view.width / view.height;
+  const t = lens(aspect);
+  const d = [0, 1, 2].map(i => cam.f[i] + cam.r[i] * nx * t * aspect + cam.u[i] * ny * t);
+  const length = Math.hypot(d[0], d[1], d[2]);
+  return d.map(v => v / length);
+};
+
+const along = (cam, d) => d[0] * cam.f[0] + d[1] * cam.f[1] + d[2] * cam.f[2];
+
+const groundDepth = (cam, ny) => {
+  const d = rayDirection(cam, 0, ny);
+  if (d[1] > -1e-3) return Infinity;
+  return (cam.eye[1] / -d[1]) * along(cam, d);
+};
+
+const nearRange = (cam, s) => [groundDepth(cam, -1) * 0.9, cam.distance, s.foreground];
+
+const settleAt = (cam, near, x, z) => {
+  const depth = (x - cam.eye[0]) * cam.f[0] - cam.eye[1] * cam.f[1] + (z - cam.eye[2]) * cam.f[2];
+  return near[2] + (1 - near[2]) * smoother((depth - near[0]) / Math.max(near[1] - near[0], 1e-3));
+};
+
+const pick = (cam, s, nx, ny) => {
+  const d = rayDirection(cam, nx, ny);
+  const height = state.elevation * HEIGHT * state.rise;
+  const frequency = FREQUENCY / state.scale;
+  const near = nearRange(cam, s);
+  const above = distance => {
+    const x = cam.eye[0] + d[0] * distance;
+    const z = cam.eye[2] + d[2] * distance;
+    const ground = relief(state.travelX + x, state.travelZ + z, frequency, state.morph * 0.37, state.morph * 0.23);
+    return cam.eye[1] + d[1] * distance - ground * height * settleAt(cam, near, x, z);
+  };
+  let distance = NEAR;
+  let gap = above(distance);
+  for (let i = 0; i < 200 && distance < FAR * 0.5; i++) {
+    const next = distance + Math.max(0.02, gap * 0.4);
+    const value = above(next);
+    if (value < 0) {
+      let lo = distance;
+      let hi = next;
+      for (let k = 0; k < 10; k++) {
+        const mid = (lo + hi) * 0.5;
+        if (above(mid) < 0) hi = mid;
+        else lo = mid;
+      }
+      return {
+        x: state.travelX + cam.eye[0] + d[0] * hi,
+        y: cam.eye[1] + d[1] * hi,
+        z: state.travelZ + cam.eye[2] + d[2] * hi,
+        depth: hi * along(cam, d)
+      };
+    }
+    distance = next;
+    gap = value;
+  }
+  return null;
+};
+
+const footprint = (cam, s, fadeEnd) => {
+  const ceiling = state.elevation * HEIGHT * state.rise * 1.7 + 0.2 + s.mouseStrength;
+  const box = { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity, near: Infinity };
+  const add = (d, distance) => {
+    const x = cam.eye[0] + d[0] * distance;
+    const z = cam.eye[2] + d[2] * distance;
+    box.minX = Math.min(box.minX, x);
+    box.maxX = Math.max(box.maxX, x);
+    box.minZ = Math.min(box.minZ, z);
+    box.maxZ = Math.max(box.maxZ, z);
+  };
+  for (const nx of [-1.08, 0, 1.08]) {
+    for (const ny of [-1.08, 1.08]) {
+      const d = rayDirection(cam, nx, ny);
+      const forward = Math.max(along(cam, d), 1e-3);
+      let near = NEAR;
+      let far = (fadeEnd * 1.05) / forward;
+      if (d[1] < -1e-4) {
+        near = Math.max(NEAR, (cam.eye[1] - ceiling) / -d[1]);
+        far = Math.min(far, cam.eye[1] / -d[1]);
+      }
+      near = Math.min(near, far);
+      add(d, near);
+      add(d, far);
+      box.near = Math.min(box.near, near * forward);
+    }
+  }
+  return box;
+};
+
+const grid = (box, cell) => {
+  const camX = Math.floor(state.travelX / cell);
+  const camZ = Math.floor(state.travelZ / cell);
+  const fracX = state.travelX - camX * cell;
+  const fracZ = state.travelZ - camZ * cell;
+  const k0 = Math.floor((box.minX + fracX) / cell) - 2;
+  const m0 = Math.floor((box.minZ + fracZ) / cell) - 2;
+  const columns = clamp(Math.ceil((box.maxX + fracX) / cell) + 2 - k0, 1, 4000);
+  const rows = clamp(Math.ceil((box.maxZ + fracZ) / cell) + 2 - m0, 1, Math.floor((MAX_CELLS * 1.5) / columns));
+  return { cell, camX, camZ, fracX, fracZ, k0, m0, columns, rows };
+};
+
+/* ---------- 鳥の飛行軌跡 → K線 ---------- */
+const GAP = 0.21;
+const WIDTH = 0.13;
+const UP = [1.0, 0.24, 0.36];   // 陽線（上昇）＝赤
+const DOWN = [0.12, 0.95, 0.6]; // 陰線（下落）＝緑
+const trail = [];
+const HEAD_X = 2.2;   // 画面の中で先頭が来る位置（ワールド座標）
+const HEAD_Z = 1.6;
+const BASE_YAW = 0.2; // 少し右前を向いて、進む方向を見る
+const fly = { tx: HEAD_X, tz: HEAD_Z, vz: 0, phase: 0, y: null, started: false, dist: 0, age: 0, open: 0, high: 0, low: 0, kick: 0, boost: 0 };
+
+const gauss = () => {
+  let u = 0;
+  let v = 0;
+  while (!u) u = Math.random();
+  while (!v) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+};
+
+const stepFlight = (dt, cam, height, energy, ny, presence) => {
+  const near = nearRange(cam, S);
+  const frequency = FREQUENCY / state.scale;
+  const mx = state.morph * 0.37;
+  const mz = state.morph * 0.23;
+  const groundAt = (tx, tz) =>
+    relief(tx, tz, frequency, mx, mz) * settleAt(cam, near, tx - state.travelX, tz - state.travelZ) * height;
+
+  // 前へ進む速さ：ふだんはゆっくり、マウスを動かす・スクロールすると加速
+  fly.boost *= Math.exp(-dt / 0.7);
+  const step = (0.8 * (1 + 2.2 * energy) + fly.boost) * dt;
+
+  // 奥行き方向は谷を探して蛇行（手前の尾根が高ければ奥へ、奥が高ければ手前へ）
+  const gNear = groundAt(fly.tx + 1.6, fly.tz - 0.9);
+  const gFar = groundAt(fly.tx + 1.6, fly.tz + 0.9);
+  const home = state.travelZ + HEAD_Z - fly.tz;
+  const desire = clamp((gNear - gFar) * 1.4 + home * 0.35 + 0.35 * Math.sin(fly.tx * 0.3), -1.2, 1.2);
+  fly.vz += (desire - fly.vz) * (1 - Math.exp(-step / 0.6));
+  fly.tx += step;
+  fly.tz += fly.vz * step;
+
+  // 上下：鳥のように滑空と羽ばたき。マウスを速く動かすほど大きく上下
+  fly.phase += dt * (1.2 + 3.2 * energy);
+  const amp = 0.28 + 0.8 * energy;
+  const glide = 0.95 + 0.3 * Math.sin(fly.tx * 0.37);
+  const flap = amp * (Math.sin(fly.phase) + 0.35 * Math.sin(fly.phase * 2.3 + 1.1));
+  fly.kick *= Math.exp(-dt / 0.5);
+  // 下へスクロール：俯冲 → そのまま山を突き抜けて落ちていく
+  const crash = story.crash;
+  const calm = story.calm;
+  const free = glide + ny * 0.6 * presence + flap * calm + fly.kick - story.dive * 0.95 - crash;
+  const target = crash > 0 ? free : Math.max(free, groundAt(fly.tx, fly.tz) + 0.3);
+  if (fly.y === null) fly.y = target;
+  fly.y += (target - fly.y) * (1 - Math.exp(-dt / 0.12));
+
+  if (!fly.started) {
+    fly.started = true;
+    fly.open = fly.high = fly.low = fly.y;
+  }
+  fly.dist += step * Math.hypot(1, fly.vz);
+  fly.high = Math.max(fly.high, fly.y);
+  fly.low = Math.min(fly.low, fly.y);
+
+  // 一定距離ごとに 1 本のローソク足として確定（始値＝前の高さ、終値＝今の高さ）
+  fly.age += dt;
+  if (fly.dist >= GAP || fly.age > 0.35 || Math.abs(fly.y - fly.open) > 0.24) {
+    fly.dist = Math.max(0, fly.dist - GAP);
+    fly.age = 0;
+    const noise = 0.012 + 0.05 * energy;
+    trail.push({
+      tx: fly.tx,
+      tz: fly.tz,
+      o: fly.open,
+      c: fly.y,
+      h: fly.high + Math.abs(gauss()) * noise + 0.01,
+      l: fly.low - Math.abs(gauss()) * noise - 0.01
+    });
+    if (trail.length > MAX_TRAIL) trail.shift();
+    fly.open = fly.y + gauss() * 0.006;
+    fly.high = fly.low = fly.open;
+  }
+};
+
+// カメラが K 線の先頭を追いかけて前へ進む
+const follow = dt => {
+  state.travelX += (fly.tx - HEAD_X - state.travelX) * (1 - Math.exp(-dt / 0.45));
+  state.travelZ += (fly.tz - HEAD_Z - state.travelZ) * (1 - Math.exp(-dt / 1.6));
+};
+
+/* ---------- スクロールの流れ：俯冲 → 大陰線が山を突き抜ける → 第2ページの地面が割れる ---------- */
+const fx = document.getElementById('fx');
+const ctx = fx.getContext('2d');
+const slot = document.getElementById('slot');
+const cue = document.getElementById('cue');
+const END = 1.6; // スクロールできる画面数
+// 俯冲が終わったら（q≥1）あとは時間で一気に流す：突き抜け → 画面が平らに → 第2ページへ → 緑の K 線が落ちて地面が割れる
+const T_IMPACT = 1.05; // 落下タイムラインの何秒目で地面にぶつかるか
+const T_END = T_IMPACT + 3;
+const story = {
+  s: 0, q: 0, dive: 0, slide: 0, dir: -1, dropT: 0, crash: 0, calm: 1, fall: 0,
+  impactT: 0, impacted: false, W: 1, H: 1, dpr: 1, fxDirty: true
+};
+const plunge = { on: false, x: 0, z: 0, y: 0, ground: 0, top: 0, bottom: 0, pulsedA: false, pulsedB: false };
+let groundCanvas = null;
+let groundKey = '';
+let crack = null;
+let shards = [];
+
+const easeIn = t => t * t;
+const easeOut = t => 1 - (1 - t) * (1 - t) * (1 - t);
+const easeInOut = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const unit = (x, a, b) => clamp((x - a) / (b - a), 0, 1);
+
+const addPulse = (x, z) => {
+  if (pulses.length >= MAX_PULSES) pulses.shift();
+  pulses.push({ x, z, age: 0 });
+};
+
+const updateStory = dt => {
+  const vh = Math.max(1, container.clientHeight);
+  story.s = clamp(window.scrollY / vh, 0, END);
+  story.q += (story.s - story.q) * (reduce ? 1 : 1 - Math.exp(-dt / 0.12));
+  if (Math.abs(story.s - story.q) < 1e-4) story.q = story.s;
+  const q = story.q;
+  story.dive = smoother(unit(q, 0.55, 1.0));
+  // 1 画面ぶん下へスクロールしたら落下スタート。0.9 より上へ戻したら巻き戻し
+  if (q >= 1.0) story.dir = 1;
+  else if (q < 0.9) story.dir = -1;
+  if (reduce) story.dropT = story.dir > 0 ? T_END : 0;
+  else if (story.dir > 0) story.dropT = Math.min(T_END, story.dropT + dt);
+  else story.dropT = Math.max(0, story.dropT - dt * (story.dropT > T_IMPACT ? 6 : 2));
+  const T = story.dropT;
+  story.crash = Math.pow(unit(T, 0, 0.55), 1.3) * 7.5;
+  story.calm = 1 - unit(T, 0, 0.2);
+  S.tilt = 28 + 34 * smoother(unit(T, 0.05, 0.6));
+  story.slide = smoother(unit(T, 0.4, 1.0));
+  story.fall = chain ? unit(T, T_IMPACT - chain.fallDur, T_IMPACT) : 0;
+  canvas.style.transform = story.slide > 0 ? `translate3d(0, ${(-story.slide * vh).toFixed(1)}px, 0)` : '';
+  // 山の層が上へ抜けていくとき、下のふちをぼかして境目をなじませる
+  const fadePx = Math.round(story.slide * vh * 0.22);
+  const mask = fadePx > 0 ? `linear-gradient(to bottom, #000 calc(100% - ${fadePx}px), transparent)` : '';
+  canvas.style.webkitMaskImage = mask;
+  canvas.style.maskImage = mask;
+  cue.style.opacity = String(clamp(1 - story.s * 6, 0, 1) * smoother(unit(state.intro, 0.6, 1)));
+
+  if (T >= T_IMPACT) {
+    if (!story.impacted) startImpact();
+    story.impactT = T - T_IMPACT;
+  } else if (story.impacted) {
+    story.impacted = false;
+    story.impactT = 0;
+    shards = [];
+  }
+  slot.style.opacity = story.impacted ? String(smoother(unit(story.impactT, 1.1, 1.7))) : '0';
+};
+
+// 大陰線：K線の先頭で育って、真下へ山を突き抜ける（3D側）
+const updatePlunge = () => {
+  if (story.dropT <= 0) {
+    plunge.on = false;
+    plunge.pulsedA = false;
+    return;
+  }
+  if (!plunge.on) {
+    plunge.on = true;
+    plunge.x = fly.tx;
+    plunge.z = fly.tz;
+  }
+  // K線の先頭が地面を突き抜けた瞬間、そこからソナーの輪が広がる
+  const g = relief(fly.tx, fly.tz, FREQUENCY / state.scale, state.morph * 0.37, state.morph * 0.23) * state.elevation * HEIGHT;
+  if (!plunge.pulsedA && fly.y < g) {
+    plunge.pulsedA = true;
+    addPulse(fly.tx, fly.tz);
+  }
+};
+
+const resizeFx = () => {
+  story.W = Math.max(1, container.clientWidth);
+  story.H = Math.max(1, container.clientHeight);
+  story.dpr = Math.min(window.devicePixelRatio || 1, 2);
+  fx.width = Math.round(story.W * story.dpr);
+  fx.height = Math.round(story.H * story.dpr);
+  makeChain();
+  groundKey = '';
+  story.fxDirty = true;
+  if (story.impacted) {
+    makeCrack();
+    makeShards();
+  }
+};
+
+// 第2ページの地面：同じ地形を真上から見た等高線図（マーチングスクエアで描く）
+const ensureGround = () => {
+  const cx = plunge.on ? plunge.x : fly.tx;
+  const cz = plunge.on ? plunge.z : fly.tz;
+  const key = `${story.W}x${story.H}@${story.dpr}|${cx.toFixed(2)},${cz.toFixed(2)}`;
+  if (key === groundKey && groundCanvas) return;
+  groundKey = key;
+  const { W, H, dpr } = story;
+  const c = groundCanvas || document.createElement('canvas');
+  c.width = Math.round(W * dpr);
+  c.height = Math.round(H * dpr);
+  const g = c.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const base = g.createLinearGradient(0, 0, 0, H);
+  base.addColorStop(0, '#050815');
+  base.addColorStop(1, '#081028');
+  g.fillStyle = base;
+  g.fillRect(0, 0, W, H);
+
+  const k = 15 / Math.max(W, H);
+  const cell = Math.max(5, Math.max(W, H) / 160);
+  const cols = Math.ceil(W / cell) + 1;
+  const rows = Math.ceil(H / cell) + 1;
+  const frequency = FREQUENCY / state.scale;
+  const ox = cx - (W * k) / 2;
+  const oz = cz - (H * k) / 2;
+  const hs = new Float32Array(cols * rows);
+  let maxH = 0.01;
+  for (let j = 0; j < rows; j++) {
+    for (let i = 0; i < cols; i++) {
+      const tx = ox + i * cell * k;
+      const tz = oz + j * cell * k;
+      const v = relief(tx, tz, frequency, state.morph * 0.37, state.morph * 0.23) + S.detail * 0.1 * fineDetail(tx, tz, frequency);
+      hs[j * cols + i] = v;
+      if (v > maxH) maxH = v;
+    }
+  }
+  const top = Math.ceil(maxH * S.lineCount);
+  for (let n = 1; n <= top; n++) {
+    const level = (n - 0.5) / S.lineCount;
+    const major = n % 5 === 0;
+    g.beginPath();
+    for (let j = 0; j < rows - 1; j++) {
+      for (let i = 0; i < cols - 1; i++) {
+        const a = hs[j * cols + i];
+        const b = hs[j * cols + i + 1];
+        const cc = hs[(j + 1) * cols + i + 1];
+        const d = hs[(j + 1) * cols + i];
+        const la = a < level;
+        const lb = b < level;
+        const lc = cc < level;
+        const ld = d < level;
+        if (la === lb && lb === lc && lc === ld) continue;
+        const x0 = i * cell;
+        const y0 = j * cell;
+        const p = [];
+        if (la !== lb) p.push(x0 + (cell * (level - a)) / (b - a), y0);
+        if (lb !== lc) p.push(x0 + cell, y0 + (cell * (level - b)) / (cc - b));
+        if (lc !== ld) p.push(x0 + (cell * (level - d)) / (cc - d), y0 + cell);
+        if (ld !== la) p.push(x0, y0 + (cell * (level - a)) / (d - a));
+        if (p.length >= 4) {
+          g.moveTo(p[0], p[1]);
+          g.lineTo(p[2], p[3]);
+        }
+        if (p.length === 8) {
+          g.moveTo(p[4], p[5]);
+          g.lineTo(p[6], p[7]);
+        }
+      }
+    }
+    const t = level / maxH;
+    g.strokeStyle = `rgba(92, 136, 255, ${Math.min(1, (0.34 + 0.6 * t) * (major ? 1.3 : 1))})`;
+    g.lineWidth = major ? 1.5 : 0.9;
+    g.shadowColor = 'rgba(79, 124, 255, 0.6)';
+    g.shadowBlur = major ? 9 : 3;
+    g.stroke();
+  }
+  g.shadowBlur = 0;
+  const vignette = g.createRadialGradient(W / 2, H * 0.45, Math.min(W, H) * 0.2, W / 2, H * 0.45, Math.max(W, H) * 0.75);
+  vignette.addColorStop(0, 'rgba(4, 6, 13, 0)');
+  vignette.addColorStop(1, 'rgba(4, 6, 13, 0.7)');
+  g.fillStyle = vignette;
+  g.fillRect(0, 0, W, H);
+  groundCanvas = c;
+};
+
+const CHAIN_SLOPE = 0.45;
+let chain = null;
+// 第2ページへ落ちてくる K 線：ふつうの大きさの陰線が、前の始値＝次の終値でつながる
+const makeChain = () => {
+  const { W, H } = story;
+  const unitH = clamp(H * 0.045, 22, 46);
+  const items = [];
+  let e = 0;
+  for (let k = 0; k < 11; k++) {
+    const h = unitH * (0.7 + Math.random() * 0.9) * (k === 0 ? 1.25 : 1);
+    items.push({ e, h, wl: 3 + Math.random() * unitH * 0.25, wh: 3 + Math.random() * unitH * 0.35 });
+    e += h;
+  }
+  const speed = H * 1.5;
+  const head = items[0];
+  const D0 = H * 0.44 + head.wl + head.h + head.wh + 12; // 頭が画面上端のすぐ外にいる距離
+  const fallDur = (1.7 * D0) / speed; // 入ってきた瞬間から動いて見える（初速あり）
+  const accel = (2 * (speed * fallDur - D0)) / (fallDur * fallDur);
+  chain = { items, w: clamp(W * 0.009, 9, 15), speed, total: e, D0, fallDur, accel, v0: speed - accel * fallDur };
+};
+// 落下中の頭の位置（撞击点からの残り距離）
+const fallDistance = () => {
+  const t = story.fall * chain.fallDur;
+  return Math.max(0, chain.D0 - chain.v0 * t - 0.5 * chain.accel * t * t);
+};
+const impactPoint = () => [story.W * 0.5, story.H * 0.44];
+const gapHalf = () => (story.W < 640 ? story.W * 0.31 : clamp(story.W * 0.2, 170, 360));
+
+// 割れ目：衝突点から上下にジグザグ。枝分かれのヒビも少し
+const makeCrack = () => {
+  const { W, H } = story;
+  const [cx, cy] = impactPoint();
+  const walk = dir => {
+    const out = [];
+    let x = cx;
+    let y = cy;
+    while (dir < 0 ? y > -H * 0.08 : y < H * 1.08) {
+      y += dir * H * (0.028 + Math.random() * 0.045);
+      x += (Math.random() - 0.5) * W * 0.055 + (cx - x) * 0.22;
+      x = clamp(x, W * 0.4, W * 0.6);
+      out.push([x, y]);
+    }
+    return out;
+  };
+  const up = walk(-1).reverse();
+  const down = walk(1);
+  const pts = [...up, [cx, cy], ...down];
+  const centerIndex = up.length;
+  const dist = new Array(pts.length).fill(0);
+  for (let i = centerIndex - 1; i >= 0; i--) dist[i] = dist[i + 1] + Math.hypot(pts[i][0] - pts[i + 1][0], pts[i][1] - pts[i + 1][1]);
+  for (let i = centerIndex + 1; i < pts.length; i++) dist[i] = dist[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+  const branches = [];
+  for (let b = 0; b < 8; b++) {
+    const idx = clamp(centerIndex + Math.round((Math.random() - 0.5) * 10), 0, pts.length - 1);
+    const side = b % 2 ? 1 : -1;
+    const line = [pts[idx].slice()];
+    let [x, y] = pts[idx];
+    const segs = 2 + Math.floor(Math.random() * 3);
+    for (let s = 0; s < segs; s++) {
+      x += side * W * (0.015 + Math.random() * 0.035);
+      y += (Math.random() - 0.5) * H * 0.06;
+      line.push([x, y]);
+    }
+    branches.push({ side, line, start: dist[idx] });
+  }
+  crack = { cx, cy, pts, centerIndex, dist, maxDist: Math.max(...dist), branches };
+};
+
+const makeShards = () => {
+  const { W, H } = story;
+  const { cx, cy, pts } = crack;
+  const size = Math.min(W, H);
+  const poly = r => {
+    const n = 3 + Math.floor(Math.random() * 3);
+    const a0 = Math.random() * Math.PI * 2;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const a = a0 + (i / n) * Math.PI * 2 + (Math.random() - 0.5) * 0.9;
+      const rr = r * (0.55 + Math.random() * 0.6);
+      out.push([Math.cos(a) * rr, Math.sin(a) * rr]);
+    }
+    return out;
+  };
+  shards = [];
+  // K線のかけら（緑）：先頭から順に、撞击点に突っ込んだ瞬間に砕ける
+  chain.items.slice(0, 8).forEach((c, k) => {
+    const n = k === 0 ? 10 : 4;
+    for (let i = 0; i < n; i++) {
+      const ang = -Math.PI / 2 + (Math.random() - 0.5) * 2.6;
+      const sp = size * (0.25 + Math.random() * 0.75);
+      shards.push({
+        x0: cx + (Math.random() - 0.5) * chain.w,
+        y0: cy - 3,
+        vx: Math.cos(ang) * sp,
+        vy: Math.sin(ang) * sp,
+        rot: Math.random() * 6.28,
+        spin: (Math.random() - 0.5) * 14,
+        poly: poly(size * (0.004 + Math.random() * 0.009)),
+        t0: c.e / chain.speed + 0.005,
+        kind: 1
+      });
+    }
+  });
+  // 地面のかけら（割れ目に沿って飛び出す）
+  for (let i = 0; i < 44; i++) {
+    const spread = Math.round((Math.random() + Math.random() - 1) * pts.length * 0.5);
+    const idx = clamp(crack.centerIndex + spread, 0, pts.length - 1);
+    const p = pts[idx];
+    const side = i % 2 ? 1 : -1;
+    const near = 1 - Math.min(1, Math.abs(p[1] - cy) / (H * 0.55));
+    shards.push({
+      x0: p[0] + side * 3,
+      y0: p[1],
+      vx: side * size * (0.1 + Math.random() * 0.5) * (0.5 + near),
+      vy: -size * (0.1 + Math.random() * 0.75) * (0.35 + near),
+      rot: Math.random() * 6.28,
+      spin: (Math.random() - 0.5) * 9,
+      poly: poly(size * (0.007 + Math.random() * 0.03 * (0.4 + near))),
+      t0: 0.1 + (Math.abs(p[1] - cy) / H) * 0.55 + Math.random() * 0.12,
+      kind: 0
+    });
+  }
+};
+
+const startImpact = () => {
+  story.impacted = true;
+  story.impactT = 0;
+  makeCrack();
+  makeShards();
+};
+
+// 割れ目の線：衝突点から外へ、reveal の長さまでだけ描く
+const crackPath = reveal => {
+  const { pts, centerIndex, dist } = crack;
+  ctx.beginPath();
+  for (const dir of [-1, 1]) {
+    ctx.moveTo(pts[centerIndex][0], pts[centerIndex][1]);
+    for (let i = centerIndex + dir; i >= 0 && i < pts.length; i += dir) {
+      const prev = pts[i - dir];
+      if (dist[i] <= reveal) {
+        ctx.lineTo(pts[i][0], pts[i][1]);
+      } else {
+        const f = (reveal - dist[i - dir]) / Math.max(dist[i] - dist[i - dir], 1e-3);
+        if (f > 0) ctx.lineTo(prev[0] + (pts[i][0] - prev[0]) * f, prev[1] + (pts[i][1] - prev[1]) * f);
+        break;
+      }
+    }
+  }
+};
+
+const platePath = side => {
+  const { W, H } = story;
+  const { pts } = crack;
+  const edge = side < 0 ? -80 : W + 80;
+  ctx.beginPath();
+  ctx.moveTo(edge, -80);
+  ctx.lineTo(pts[0][0], -80);
+  for (const p of pts) ctx.lineTo(p[0], p[1]);
+  ctx.lineTo(pts[pts.length - 1][0], H + 80);
+  ctx.lineTo(edge, H + 80);
+  ctx.closePath();
+};
+
+const drawChain = D => {
+  const { W, H } = story;
+  const [cx, cy] = impactPoint();
+  const w = chain.w;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(-50, -H, W + 100, cy + H);
+  ctx.clip();
+  for (let k = chain.items.length - 1; k >= 0; k--) {
+    const c = chain.items[k];
+    const tip = cy - D - c.e;
+    const x = cx - CHAIN_SLOPE * (D + c.e);
+    const bodyBottom = tip - c.wl;
+    const bodyTop = bodyBottom - c.h;
+    const wickTop = bodyTop - c.wh;
+    if (tip < -10 || wickTop >= cy) continue;
+    // 落ちる軌跡のすじ
+    const streak = ctx.createLinearGradient(x, bodyTop, x - CHAIN_SLOPE * 70, bodyTop - 70);
+    streak.addColorStop(0, 'rgba(44, 240, 160, 0.28)');
+    streak.addColorStop(1, 'rgba(44, 240, 160, 0)');
+    ctx.strokeStyle = streak;
+    ctx.lineWidth = w * 0.6;
+    ctx.beginPath();
+    ctx.moveTo(x, bodyTop + c.h * 0.5);
+    ctx.lineTo(x - CHAIN_SLOPE * 70, bodyTop - 70);
+    ctx.stroke();
+    ctx.shadowColor = 'rgba(44, 240, 160, 0.9)';
+    ctx.shadowBlur = 14;
+    ctx.fillStyle = '#7dffcf';
+    ctx.fillRect(x - 0.9, wickTop, 1.8, tip - wickTop);
+    ctx.fillStyle = '#22e596';
+    ctx.fillRect(x - w / 2, bodyTop, w, c.h);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(215, 255, 238, 0.5)';
+    ctx.fillRect(x - w * 0.15, bodyTop + 2, w * 0.3, Math.max(0, c.h - 4));
+  }
+  ctx.restore();
+};
+
+const drawShards = () => {
+  const { H } = story;
+  const G = Math.min(story.W, story.H) * 2.6;
+  for (const sh of shards) {
+    const t = story.impactT - sh.t0;
+    if (t <= 0) continue;
+    const x = sh.x0 + sh.vx * t;
+    const y = sh.y0 + sh.vy * t + 0.5 * G * t * t;
+    if (y > H + 80) continue;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(sh.rot + sh.spin * t);
+    ctx.beginPath();
+    sh.poly.forEach(([px, py], i) => (i ? ctx.lineTo(px, py) : ctx.moveTo(px, py)));
+    ctx.closePath();
+    if (sh.kind === 1) {
+      ctx.globalAlpha = clamp(1 - (t - 0.7) / 0.8, 0, 1);
+      ctx.shadowColor = 'rgba(44, 240, 160, 0.9)';
+      ctx.shadowBlur = 14;
+      ctx.fillStyle = '#5effc0';
+      ctx.fill();
+    } else {
+      ctx.fillStyle = '#0b1431';
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = t < 0.5 ? 'rgba(90, 255, 180, 0.9)' : 'rgba(120, 160, 255, 0.85)';
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+};
+
+const drawFx = () => {
+  const { W, H, dpr } = story;
+  const q = story.q;
+  const active = story.slide > 0 || story.fall > 0 || story.impacted;
+  if (!active) {
+    if (story.fxDirty) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, fx.width, fx.height);
+      story.fxDirty = false;
+    }
+    return;
+  }
+  story.fxDirty = true;
+  ensureGround();
+  const T = story.impacted ? story.impactT : 0;
+  const [cx, cy] = impactPoint();
+  const oy = (1 - story.slide) * H;
+  const shake = story.impacted ? 9 * Math.max(0, 1 - T / 0.45) : 0;
+  const sx = (Math.random() - 0.5) * shake;
+  const sy = (Math.random() - 0.5) * shake;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(sx, oy + sy);
+
+  if (!story.impacted) {
+    ctx.drawImage(groundCanvas, -16, -16, W + 32, H + 32);
+  } else {
+    const sep = easeInOut(unit(T, 0.38, 1.3)) * gapHalf();
+    const reveal = easeOut(unit(T, 0.06, 0.46)) * crack.maxDist;
+    const fresh = 1 - unit(T, 0.6, 2.2);
+
+    // 割れ目の奥（ここが空いて、あとで実験の方向を書く場所になる）
+    ctx.fillStyle = '#010207';
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+    if (sep > 1) {
+      const glow = ctx.createLinearGradient(cx - sep, 0, cx + sep, 0);
+      glow.addColorStop(0, 'rgba(44, 240, 160, 0.10)');
+      glow.addColorStop(0.5, 'rgba(44, 240, 160, 0)');
+      glow.addColorStop(1, 'rgba(44, 240, 160, 0.10)');
+      ctx.fillStyle = glow;
+      ctx.fillRect(-20, -20, W + 40, H + 40);
+    }
+
+    for (const side of [-1, 1]) {
+      ctx.save();
+      ctx.translate(side * sep, side * sep * 0.025);
+      platePath(side);
+      ctx.save();
+      ctx.clip();
+      ctx.drawImage(groundCanvas, -16, -16, W + 32, H + 32);
+      if (sep > 1) {
+        crackPath(crack.maxDist);
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
+        ctx.lineWidth = 30;
+        ctx.stroke();
+        ctx.lineWidth = 10;
+        ctx.stroke();
+      }
+      ctx.restore();
+      // 枝分かれのヒビ
+      ctx.lineWidth = 1.1;
+      for (const br of crack.branches) {
+        if (br.side !== side || reveal < br.start) continue;
+        const f = clamp((reveal - br.start) / (crack.maxDist * 0.25), 0, 1);
+        const n = Math.max(1, Math.ceil((br.line.length - 1) * f));
+        ctx.beginPath();
+        ctx.moveTo(br.line[0][0], br.line[0][1]);
+        for (let i = 1; i <= n; i++) ctx.lineTo(br.line[i][0], br.line[i][1]);
+        ctx.strokeStyle = `rgba(${Math.round(60 + 60 * (1 - fresh))}, ${Math.round(160 + 95 * fresh)}, ${Math.round(255 - 85 * fresh)}, ${0.45 + 0.4 * fresh})`;
+        ctx.stroke();
+      }
+      // 割れ目のふち（できたては緑に光り、だんだん青に落ち着く）
+      crackPath(reveal);
+      ctx.shadowColor = fresh > 0.3 ? 'rgba(44, 240, 160, 0.9)' : 'rgba(79, 124, 255, 0.8)';
+      ctx.shadowBlur = 12;
+      ctx.strokeStyle = `rgba(${Math.round(60 + 70 * (1 - fresh))}, ${Math.round(170 + 85 * fresh)}, ${Math.round(255 - 80 * fresh)}, 0.95)`;
+      ctx.lineWidth = 1.6 + 1.4 * fresh;
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.restore();
+    }
+
+    // 衝撃波（ソナーの輪）
+    for (const t0 of [0.04, 0.14, 0.27]) {
+      const tt = T - t0;
+      if (tt <= 0 || tt > 1.2) continue;
+      const r = (1 - Math.exp(-tt * 3.2)) * Math.max(W, H) * 0.7;
+      const a = Math.pow(1 - tt / 1.2, 2);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(120, 160, 255, ${a * 0.8})`;
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * 0.94, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(44, 240, 160, ${a * 0.5})`;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    // 閃光
+    const flash = T < 0.06 ? T / 0.06 : Math.max(0, 1 - (T - 0.06) / 0.55);
+    if (flash > 0) {
+      const fl = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(W, H) * 0.45);
+      fl.addColorStop(0, `rgba(190, 255, 225, ${0.5 * flash})`);
+      fl.addColorStop(0.25, `rgba(44, 240, 160, ${0.22 * flash})`);
+      fl.addColorStop(1, 'rgba(44, 240, 160, 0)');
+      ctx.fillStyle = fl;
+      ctx.fillRect(-20, -20, W + 40, H + 40);
+    }
+    drawShards();
+  }
+
+  // 落ちてくる大陰線が近づくと、地面に緑の照り返し
+  if (!story.impacted) {
+    const a = 0.3 * Math.pow(story.fall, 3);
+    if (a > 0.002) {
+      const gl2 = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.min(W, H) * 0.35);
+      gl2.addColorStop(0, `rgba(44, 240, 160, ${a})`);
+      gl2.addColorStop(1, 'rgba(44, 240, 160, 0)');
+      ctx.fillStyle = gl2;
+      ctx.fillRect(-20, -20, W + 40, H + 40);
+    }
+  }
+  // 上の山の層と重なる上端は、色を塗らずに透明へ溶かす（線が残らないように）
+  if (story.slide < 1) {
+    const k = 1 - unit(story.slide, 0.9, 1);
+    const top = -40;
+    const seam = ctx.createLinearGradient(0, top, 0, H * 0.16);
+    seam.addColorStop(0, `rgba(0, 0, 0, ${k})`);
+    seam.addColorStop(0.15, `rgba(0, 0, 0, ${k * 0.92})`);
+    seam.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillStyle = seam;
+    ctx.fillRect(-20, top, W + 40, H * 0.16 - top);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.restore();
+
+  // 落ちてくる K 線（ふつうの大きさの陰線の連なり）。先頭から順に撞击点へ突っ込む
+  ctx.save();
+  ctx.translate(sx, sy);
+  if (!story.impacted) {
+    if (story.fall > 0) drawChain(fallDistance());
+  } else {
+    const D = -story.impactT * chain.speed;
+    if (D > -(chain.total + H * 0.3)) drawChain(D);
+  }
+  ctx.restore();
+};
+
+const writeCandle = (n, x, y, z, w, l, h, o, c, intensity, alpha, hot) => {
+  let lo = Math.min(o, c);
+  let hi = Math.max(o, c);
+  if (hi - lo < 0.014) {
+    const mid = (hi + lo) * 0.5;
+    lo = mid - 0.007;
+    hi = mid + 0.007;
+  }
+  const col = c >= o ? UP : DOWN;
+  const k = n * FLOATS;
+  candleData[k] = x;
+  candleData[k + 1] = y;
+  candleData[k + 2] = z;
+  candleData[k + 3] = w;
+  candleData[k + 4] = Math.min(l, lo);
+  candleData[k + 5] = Math.max(h, hi);
+  candleData[k + 6] = lo;
+  candleData[k + 7] = hi;
+  candleData[k + 8] = col[0];
+  candleData[k + 9] = col[1];
+  candleData[k + 10] = col[2];
+  candleData[k + 11] = intensity;
+  candleData[k + 12] = alpha;
+  candleData[k + 13] = hot;
+  candleData[k + 14] = 0;
+  candleData[k + 15] = 0;
+};
+
+const buildCandles = () => {
+  const total = trail.length;
+  const ripple = reduce ? 0 : 0.02 + 0.14 * state.energy;
+  let n = 0;
+  for (let i = 0; i < total; i++) {
+    const k = trail[i];
+    const age = (total - 1 - i) / MAX_TRAIL;
+    const wave = ripple * Math.sin(state.clock * 2.4 - (total - i) * 0.24) * (1 - age * 0.6);
+    const alpha = 1 - smoother((age - 0.55) / 0.45);
+    writeCandle(n++, k.tx - state.travelX, wave, k.tz - state.travelZ, WIDTH, k.l, k.h, k.o, k.c, 1 + 0.5 * state.energy, alpha, 0);
+  }
+  // 先頭：いま形成中のローソク足（白く光る）
+  if (fly.started) {
+    writeCandle(n++, fly.tx - state.travelX, 0, fly.tz - state.travelZ, WIDTH * 1.1, fly.low - 0.015, fly.high + 0.015, fly.open, fly.y, 1.4, 1, 0.5);
+  }
+  candleCount = n;
+};
+
+const render = () => {
+  const s = S;
+  const cam = camera();
+  viewProjection(cam, view.width / view.height, matrix);
+
+  const bottom = groundDepth(cam, -1);
+  const top = Math.min(groundDepth(cam, 1), cam.distance * 3.2);
+  const horizon = Math.max(top, bottom * 1.6, cam.distance * 1.4);
+  const fadeEnd = horizon + (bottom * 1.8 - horizon) * s.fog;
+  const fadeStart = fadeEnd * 0.7 + (bottom * 0.7 - fadeEnd * 0.7) * s.fog;
+  const box = footprint(cam, s, fadeEnd);
+
+  const cellKey = `${view.width}x${view.height}@${view.ratio}|${Math.round(state.tilt / 4)}|${Math.round(state.elevation * 5)}|${s.fog}`;
+  if (cellKey !== view.cellKey) {
+    view.cellKey = cellKey;
+    const focal = (view.height * view.ratio * 0.5) / lens(view.width / view.height);
+    let cell = clamp((14 * Math.max(box.near, 0.5)) / focal, 0.02, 0.4);
+    const cells = ((box.maxX - box.minX) * (box.maxZ - box.minZ)) / (cell * cell);
+    if (cells > MAX_CELLS) cell *= Math.sqrt(cells / MAX_CELLS);
+    view.cell = cell;
+  }
+
+  const color = toRgb(s.color);
+  const height = state.elevation * HEIGHT * state.rise;
+  const layout = grid(box, view.cell);
+  const near = nearRange(cam, s);
+  const touch = state.hit && s.mouseInteraction ? state.presence : 0;
+  const heatStrength = touch * (0.35 + 0.5 * s.mouseStrength);
+  const focusScale = s.depthOfField * view.height * 0.016;
+  const reveal = smoother(state.intro / 0.35);
+  const candleReveal = smoother((state.intro - 0.25) / 0.45);
+  const hitX = state.hit ? state.hit.x : 0;
+  const hitZ = state.hit ? state.hit.z : 0;
+
+  pulseData.fill(0);
+  pulses.forEach((p, i) => {
+    pulseData.set([p.x, p.z, p.age * 4.2, Math.exp(-p.age * 1.1) * smoother(p.age / 0.08)], i * 4);
+  });
+
+  if (candleCount) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, candleBuffer);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, candleData, 0, candleCount * FLOATS);
+  }
+
+  gl.bindVertexArray(vao);
+  if (fieldProgram) {
+    const width = layout.columns + 7;
+    const height2 = layout.rows + 7;
+    reserveField(width, height2);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, field.framebuffer);
+    gl.viewport(0, 0, width, height2);
+    gl.useProgram(fieldProgram.program);
+    const f = fieldProgram.uniforms;
+    bind(0, sculpt ? sculpt[sculptIndex].texture : blank);
+    gl.uniform1i(f.uSculpt, 0);
+    gl.uniform1f(f.uSculptOn, sculpt ? 1 : 0);
+    gl.uniform1f(f.uFrequency, FREQUENCY / state.scale);
+    gl.uniform2f(f.uMorph, state.morph * 0.37, state.morph * 0.23);
+    gl.uniform4fv(f.uPulses, pulseData);
+    gl.uniform2i(f.uBase, layout.k0 - 2 + layout.camX, layout.m0 - 2 + layout.camZ);
+    gl.uniform1f(f.uCell, layout.cell);
+    gl.uniform1f(f.uDetail, s.detail);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  const drawTerrain = (pixel, width, targetHeight, stride) => {
+    gl.viewport(0, 0, width, targetHeight);
+    gl.useProgram(terrain.program);
+    const u = terrain.uniforms;
+    bind(0, fieldProgram ? field.texture : blank);
+    gl.uniform1i(u.uField, 0);
+    bind(1, fieldProgram ? field.heights : blank);
+    gl.uniform1i(u.uHeightField, 1);
+    gl.uniform1f(u.uFrequency, FREQUENCY / state.scale);
+    gl.uniform2f(u.uMorph, state.morph * 0.37, state.morph * 0.23);
+    gl.uniform4fv(u.uPulses, pulseData);
+    gl.uniform2i(u.uOrigin, layout.k0, layout.m0);
+    gl.uniform2i(u.uCamCell, layout.camX, layout.camZ);
+    gl.uniform2f(u.uCamFrac, layout.fracX, layout.fracZ);
+    gl.uniform1f(u.uCell, layout.cell);
+    gl.uniform1i(u.uStride, stride);
+    gl.uniform1f(u.uHeight, height);
+    gl.uniform3fv(u.uEye, cam.eye);
+    gl.uniform3fv(u.uForward, cam.f);
+    gl.uniform3fv(u.uNear, near);
+    gl.uniform1f(u.uRefDepth, cam.distance);
+    gl.uniformMatrix4fv(u.uViewProj, false, matrix);
+    gl.uniform1f(u.uDetail, s.detail);
+    gl.uniform1f(u.uLines, s.lineCount);
+    gl.uniform1f(u.uLineWidth, s.lineWidth * pixel);
+    gl.uniform1f(u.uMajor, s.majorLines ? 1 : 0);
+    gl.uniform3fv(u.uColor, color);
+    gl.uniform1f(u.uBrightness, s.brightness);
+    gl.uniform2f(u.uFade, fadeStart, fadeEnd);
+    gl.uniform3f(u.uFocus, state.focus, focusScale * pixel, view.height * 0.03 * pixel);
+    gl.uniform4f(u.uHeat, hitX, hitZ, 0.9 * s.mouseRadius, heatStrength);
+    gl.uniform4f(u.uLamp, hitX, state.hit ? state.hit.y + 1.4 : 0, hitZ, heatStrength);
+    gl.uniform4f(u.uTrace, state.level, state.trace, hitX, hitZ);
+    gl.uniform3fv(u.uSun, SUN);
+    gl.uniform1f(u.uReveal, reveal);
+    gl.uniform1f(u.uLightMode, 0);
+    gl.uniform1f(u.uOpacity, s.opacity);
+    gl.uniform4fv(u.uGlitch, glitchData);
+    gl.uniform1f(u.uGlitchSeed, 0);
+    gl.uniform1f(u.uPixel, pixel);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LESS);
+    gl.disable(gl.BLEND);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clearDepth(1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 2 * (Math.ceil(layout.columns / stride) + 1), Math.ceil(layout.rows / stride));
+
+    // K線：地形と同じ深度バッファを使うので、手前の尾根に隠れたり出てきたりする
+    if (candleCount && candleReveal > 0) {
+      gl.bindVertexArray(candleVao);
+      gl.useProgram(candleProgram.program);
+      const c = candleProgram.uniforms;
+      gl.uniformMatrix4fv(c.uViewProj, false, matrix);
+      gl.uniform3fv(c.uRight, cam.r);
+      gl.uniform2f(c.uFade, fadeStart, fadeEnd);
+      gl.uniform1f(c.uReveal, candleReveal);
+      gl.depthFunc(gl.LESS);
+      gl.depthMask(true);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, candleCount);
+      gl.disable(gl.BLEND);
+      gl.bindVertexArray(vao);
+    }
+    gl.disable(gl.DEPTH_TEST);
+  };
+
+  const bloom = s.glow > 0.001;
+  if (bloom) {
+    const width = Math.max(1, Math.round(view.width / 2));
+    const targetHeight = Math.max(1, Math.round(view.height / 2));
+    allocate(source, width, targetHeight, true);
+    levels.forEach((pair, index) => {
+      const w = Math.max(1, Math.round(view.width / 2 ** (index + 2)));
+      const h = Math.max(1, Math.round(view.height / 2 ** (index + 2)));
+      allocate(pair[0], w, h, false);
+      allocate(pair[1], w, h, false);
+    });
+    gl.bindFramebuffer(gl.FRAMEBUFFER, source.framebuffer);
+    drawTerrain(0.5, width, targetHeight, 2);
+    let from = source;
+    levels.forEach(([front, back]) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, front.framebuffer);
+      gl.viewport(0, 0, front.width, front.height);
+      gl.useProgram(downProgram.program);
+      bind(0, from.texture);
+      gl.uniform1i(downProgram.uniforms.uSource, 0);
+      gl.uniform2f(downProgram.uniforms.uTarget, front.width, front.height);
+      gl.uniform2f(downProgram.uniforms.uTexel, 1 / from.width, 1 / from.height);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.useProgram(blurProgram.program);
+      gl.uniform1i(blurProgram.uniforms.uSource, 0);
+      gl.uniform2f(blurProgram.uniforms.uTarget, back.width, back.height);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, back.framebuffer);
+      bind(0, front.texture);
+      gl.uniform2f(blurProgram.uniforms.uStep, 1 / front.width, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, front.framebuffer);
+      bind(0, back.texture);
+      gl.uniform2f(blurProgram.uniforms.uStep, 0, 1 / back.height);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      from = front;
+    });
+  }
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  drawTerrain(view.ratio, canvas.width, canvas.height, 1);
+
+  if (bloom) {
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(compositeProgram.program);
+    const c = compositeProgram.uniforms;
+    levels.forEach(([front], index) => {
+      bind(index, front.texture);
+      gl.uniform1i(c[`uBloom${index}`], index);
+    });
+    gl.uniform2f(c.uView, canvas.width, canvas.height);
+    gl.uniform1f(c.uGlow, s.glow * reveal);
+    gl.uniform1f(c.uLightMode, 0);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.disable(gl.BLEND);
+  }
+  for (let unit = BLOOM_LEVELS; unit >= 0; unit--) bind(unit, null);
+};
+
+const updateSculpt = (s, dt) => {
+  if (!sculpt || !sculptProgram) return false;
+  const brush = s.mouseInteraction && s.hoverEffect === 'lift' && state.presence > 0.001 ? state.hit : null;
+  const burst = state.burst;
+  if (!brush && !burst && state.sculptLife <= 0) return false;
+  const from = state.brushFrom || brush;
+  const read = sculpt[sculptIndex];
+  const write = sculpt[1 - sculptIndex];
+  gl.bindFramebuffer(gl.FRAMEBUFFER, write.framebuffer);
+  gl.viewport(0, 0, SCULPT_SIZE, SCULPT_SIZE);
+  gl.useProgram(sculptProgram.program);
+  const u = sculptProgram.uniforms;
+  bind(0, read.texture);
+  gl.uniform1i(u.uPrevious, 0);
+  if (brush && from) gl.uniform4f(u.uSegment, from.x, from.z, brush.x, brush.z);
+  else gl.uniform4f(u.uSegment, 0, 0, 0, 0);
+  gl.uniform4f(u.uBrush, 1.1 * s.mouseRadius, 0.9 * s.mouseStrength, 1 - Math.exp(-dt * 7), brush ? state.presence : 0);
+  gl.uniform4f(u.uBurst, 0, 0, 1, 0);
+  const tau = 0.25 + 3 * s.trail * s.trail;
+  gl.uniform2f(u.uDecay, Math.exp(-dt / tau), Math.exp(-dt / 0.7));
+  gl.disable(gl.BLEND);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  sculptIndex = 1 - sculptIndex;
+  state.brushFrom = brush ? { x: brush.x, z: brush.z } : null;
+  if (brush) state.sculptLife = tau * 6;
+  else state.sculptLife -= dt;
+  return true;
+};
+
+const resize = () => {
+  view.width = Math.max(1, container.clientWidth);
+  view.height = Math.max(1, container.clientHeight);
+  view.ratio = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.max(1, Math.round(view.width * view.ratio));
+  canvas.height = Math.max(1, Math.round(view.height * view.ratio));
+  resizeFx();
+  render();
+  wake();
+};
+
+// 最初から画面に K 線が流れているように、完成後の地形の高さで少し先まで飛ばしておく
+const warmUp = () => {
+  view.width = Math.max(1, container.clientWidth);
+  view.height = Math.max(1, container.clientHeight);
+  state.yaw = BASE_YAW;
+  const keepRise = state.rise;
+  state.rise = 1;
+  const height = state.elevation * HEIGHT;
+  for (let i = 0; i < 60 * 40 && trail.length < MAX_TRAIL * 0.9; i++) {
+    stepFlight(1 / 60, camera(), height, 0, 0, 0);
+    follow(1 / 60);
+  }
+  state.rise = keepRise;
+};
+
+const frame = now => {
+  raf = 0;
+  if (!visible || document.hidden) return;
+  const s = S;
+  const dt = last ? clamp((now - last) / 1000, 0, 1 / 20) : 1 / 60;
+  last = now;
+  updateStory(dt);
+
+  if (!s.intro || reduce) state.intro = 1;
+  else if (state.intro < 1) state.intro = Math.min(1, state.intro + dt / INTRO_SECONDS);
+  state.rise = smoother(state.intro);
+  const ease = reduce ? 1 : 1 - Math.exp(-dt / 0.4);
+  state.tilt += (s.tilt - state.tilt) * ease;
+  state.elevation += (s.elevation - state.elevation) * ease;
+  state.clock += dt;
+
+  if (!reduce) state.morph += s.morph * 0.12 * dt;
+
+  const engaged = pointer.inside && s.mouseInteraction;
+  state.presence += ((engaged ? 1 : 0) - state.presence) * (1 - Math.exp(-dt / (engaged ? 0.18 : 0.45)));
+
+  // マウスの速さ → 揺れの大きさ（すぐ上がって、ゆっくり落ち着く）
+  pointer.speed *= Math.exp(-dt / 0.14);
+  const want = engaged && !reduce ? clamp(pointer.speed / 1600, 0, 1) : 0;
+  state.energy += (want - state.energy) * (1 - Math.exp(-dt / (want > state.energy ? 0.18 : 1.3)));
+
+  const nx = (pointer.x / view.width) * 2 - 1;
+  const ny = 1 - (pointer.y / view.height) * 2;
+  const lean = reduce || !engaged ? 0 : s.parallax;
+  const targetYaw = BASE_YAW + nx * lean * 0.09;
+  const targetPitch = -ny * lean * 0.045;
+  state.yawVelocity += (38 * (targetYaw - state.yaw) - 11 * state.yawVelocity) * dt;
+  state.pitchVelocity += (38 * (targetPitch - state.pitch) - 11 * state.pitchVelocity) * dt;
+  state.yaw += state.yawVelocity * dt;
+  state.pitch += state.pitchVelocity * dt;
+
+  const cam = camera();
+  if (engaged) state.hit = pick(cam, s, nx, ny);
+  else if (state.presence < 0.002) state.hit = null;
+
+  const tracing = state.hit && s.mouseInteraction && s.hoverEffect === 'trace' ? state.presence : 0;
+  if (state.hit) {
+    const frequency = FREQUENCY / state.scale;
+    const target =
+      relief(state.hit.x, state.hit.z, frequency, state.morph * 0.37, state.morph * 0.23) +
+      s.detail * 0.1 * fineDetail(state.hit.x, state.hit.z, frequency);
+    state.level = state.trace < 0.01 ? target : state.level + (target - state.level) * (1 - Math.exp(-dt / 0.09));
+  }
+  state.trace += (tracing - state.trace) * (1 - Math.exp(-dt / 0.2));
+
+  const focusTarget = state.hit && s.depthOfField > 0 ? state.hit.depth : cam.distance;
+  state.focus += (focusTarget - state.focus) * (1 - Math.exp(-dt / 0.35));
+
+  for (let i = pulses.length - 1; i >= 0; i--) {
+    pulses[i].age += dt;
+    if (pulses[i].age > 4) pulses.splice(i, 1);
+  }
+
+  if (!reduce && story.slide < 0.999) stepFlight(dt, cam, state.elevation * HEIGHT, state.energy, ny, state.presence);
+  if (!reduce) follow(dt);
+  updatePlunge();
+  buildCandles();
+
+  if (story.slide < 0.999) {
+    updateSculpt(s, dt);
+    render();
+  }
+  drawFx();
+  raf = requestAnimationFrame(frame);
+};
+
+function wake() {
+  if (!raf && visible && !document.hidden) {
+    last = 0;
+    raf = requestAnimationFrame(frame);
+  }
+}
+
+const locate = event => {
+  const rect = container.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  return { x, y, inside: x >= 0 && y >= 0 && x <= rect.width && y <= rect.height };
+};
+
+const onPointerMove = event => {
+  const { x, y, inside } = locate(event);
+  const was = pointer.inside;
+  const now = performance.now();
+  if (inside && was && pointer.t) {
+    const gap = Math.max(8, now - pointer.t);
+    const instant = (Math.hypot(x - pointer.x, y - pointer.y) / gap) * 1000;
+    pointer.speed = Math.max(pointer.speed * 0.75, instant);
+  }
+  pointer.t = now;
+  pointer.inside = inside;
+  if (inside) {
+    pointer.x = x;
+    pointer.y = y;
+  }
+  if (inside || was) wake();
+};
+
+const onPointerDown = event => {
+  const { x, y, inside } = locate(event);
+  if (!inside) return;
+  pointer.x = x;
+  pointer.y = y;
+  pointer.inside = true;
+  wake();
+  fly.kick = 0.9; // クリック：急騰するように跳ね上がる
+  const hit = pick(camera(), S, (x / view.width) * 2 - 1, 1 - (y / view.height) * 2);
+  if (!hit) return;
+  if (pulses.length >= MAX_PULSES) pulses.shift();
+  pulses.push({ x: hit.x, z: hit.z, age: 0 });
+};
+
+const onPointerUp = event => {
+  if (event.pointerType !== 'touch') return;
+  pointer.inside = false;
+  wake();
+};
+
+const onPointerLeave = () => {
+  pointer.inside = false;
+  wake();
+};
+
+new ResizeObserver(resize).observe(container);
+new IntersectionObserver(entries => {
+  visible = entries.some(entry => entry.isIntersecting);
+  if (visible) wake();
+}).observe(container);
+window.addEventListener('pointermove', onPointerMove, { passive: true });
+window.addEventListener('pointerdown', onPointerDown, { passive: true });
+window.addEventListener('pointerup', onPointerUp, { passive: true });
+window.addEventListener('pointercancel', onPointerUp, { passive: true });
+document.documentElement.addEventListener('pointerleave', onPointerLeave);
+document.addEventListener('visibilitychange', () => wake());
+// 下へスクロールすると K 線が前へ加速（カメラもついていく）
+let lastScroll = window.scrollY;
+window.addEventListener(
+  'scroll',
+  () => {
+    const y = window.scrollY;
+    const delta = y - lastScroll;
+    lastScroll = y;
+    if (delta > 0 && story.q < 1) fly.boost = Math.min(4, fly.boost + delta * 0.012);
+    wake();
+  },
+  { passive: true }
+);
+
+// 開くたびに最初の画面から。ブラウザや外側のページがあとから位置を戻してきても、
+// 本人がまだ何も操作していない最初の数秒は 0 に戻す
+if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+let touched = false;
+const markTouched = () => { touched = true; };
+['wheel', 'touchstart', 'keydown', 'pointerdown'].forEach(type =>
+  window.addEventListener(type, markTouched, { passive: true, capture: true })
+);
+const guardUntil = performance.now() + 4000;
+const toTop = () => {
+  if (touched || performance.now() > guardUntil || window.scrollY === 0) return;
+  window.scrollTo(0, 0);
+  lastScroll = 0;
+  story.q = 0;
+  story.dir = -1;
+  story.dropT = 0;
+  fly.boost = 0;
+};
+window.addEventListener('scroll', toTop, { passive: true });
+window.addEventListener('load', toTop);
+window.addEventListener('pageshow', toTop);
+window.scrollTo(0, 0);
+warmUp();
+buildCandles();
+resize();
+})();
+</script>
+</body>
+</html>
